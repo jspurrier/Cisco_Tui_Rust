@@ -14,25 +14,23 @@ use model::{CiscoOs, ConnectionConfig, L2vpnServiceType, SshRequest, SshResponse
 use ratatui::{backend::CrosstermBackend, Terminal};
 use ssh::SshWorker;
 use std::env;
-use std::io::{self, IsTerminal};
-use std::process::Command;
+use std::io;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// If the binary is double-clicked from a desktop file manager on Linux/Unix (where `stdin` is not a TTY),
-/// re-launches the executable inside an available desktop terminal emulator so the TUI window opens automatically.
-/// On Windows, console `.exe` binaries automatically open a console window when double-clicked.
+/// If the binary is double-clicked from a desktop file manager on Linux or macOS (where `stdin` is not a TTY),
+/// re-launches the executable inside a desktop terminal window so the TUI opens automatically.
+/// On Windows, console `.exe` binaries open a console window natively when double-clicked.
 fn ensure_running_in_terminal_if_needed() {
     #[cfg(unix)]
     {
+        use std::io::IsTerminal;
+        use std::process::Command;
+
         if io::stdin().is_terminal() && io::stdout().is_terminal() {
             return;
         }
         if env::var("CISCO_TUI_IN_TERMINAL").is_ok() {
-            return;
-        }
-        // Only attempt to spawn a graphical terminal if a display server (Wayland or X11) is active
-        if env::var("DISPLAY").is_err() && env::var("WAYLAND_DISPLAY").is_err() {
             return;
         }
 
@@ -41,32 +39,55 @@ fn ensure_running_in_terminal_if_needed() {
         };
         let forwarded_arguments: Vec<String> = env::args().skip(1).collect();
 
-        let terminal_candidates: &[(&str, &[&str])] = &[
-            ("ptyxis", &["--"]),
-            ("kgx", &["--"]),
-            ("gnome-terminal", &["--"]),
-            ("xfce4-terminal", &["-x"]),
-            ("konsole", &["-e"]),
-            ("mate-terminal", &["-x"]),
-            ("tilix", &["-e"]),
-            ("kitty", &["--"]),
-            ("alacritty", &["-e"]),
-            ("wezterm", &["start", "--"]),
-            ("x-terminal-emulator", &["-e"]),
-            ("xterm", &["-e"]),
-        ];
-
-        for (terminal_binary, separator_flags) in terminal_candidates {
-            let mut command = Command::new(terminal_binary);
-            command.env("CISCO_TUI_IN_TERMINAL", "1");
-            for flag in *separator_flags {
-                command.arg(flag);
+        #[cfg(target_os = "macos")]
+        {
+            let mut open_command = Command::new("open");
+            open_command
+                .env("CISCO_TUI_IN_TERMINAL", "1")
+                .arg("-a")
+                .arg("Terminal")
+                .arg(&current_executable);
+            if !forwarded_arguments.is_empty() {
+                open_command.arg("--args").args(&forwarded_arguments);
             }
-            command.arg(&current_executable);
-            command.args(&forwarded_arguments);
-
-            if command.spawn().is_ok() {
+            if open_command.spawn().is_ok() {
                 std::process::exit(0);
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            if env::var("DISPLAY").is_err() && env::var("WAYLAND_DISPLAY").is_err() {
+                return;
+            }
+
+            let terminal_candidates: &[(&str, &[&str])] = &[
+                ("ptyxis", &["--"]),
+                ("kgx", &["--"]),
+                ("gnome-terminal", &["--"]),
+                ("xfce4-terminal", &["-x"]),
+                ("konsole", &["-e"]),
+                ("mate-terminal", &["-x"]),
+                ("tilix", &["-e"]),
+                ("kitty", &["--"]),
+                ("alacritty", &["-e"]),
+                ("wezterm", &["start", "--"]),
+                ("x-terminal-emulator", &["-e"]),
+                ("xterm", &["-e"]),
+            ];
+
+            for (terminal_binary, separator_flags) in terminal_candidates {
+                let mut command = Command::new(terminal_binary);
+                command.env("CISCO_TUI_IN_TERMINAL", "1");
+                for flag in *separator_flags {
+                    command.arg(flag);
+                }
+                command.arg(&current_executable);
+                command.args(&forwarded_arguments);
+
+                if command.spawn().is_ok() {
+                    std::process::exit(0);
+                }
             }
         }
     }

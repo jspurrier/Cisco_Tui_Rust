@@ -1,0 +1,187 @@
+name: Build Portable Binaries (Windows, macOS, Linux)
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_RELEASE_OPT_LEVEL: "3"
+  CARGO_PROFILE_RELEASE_DEBUG: "false"
+  CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "false"
+  CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS: "false"
+  CARGO_PROFILE_RELEASE_LTO: "fat"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+  CARGO_PROFILE_RELEASE_STRIP: "symbols"
+  CARGO_PROFILE_RELEASE_PANIC: "abort"
+  CARGO_PROFILE_RELEASE_INCREMENTAL: "false"
+
+jobs:
+  build-windows:
+    name: Windows Portable (.exe)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run unit tests
+        run: cargo test --target x86_64-pc-windows-msvc
+
+      - name: Build standalone portable Windows .exe (opt-level 3, fat LTO, no debug, static CRT)
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Stage Windows portable executable
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/x86_64-pc-windows-msvc/release/cisco-tui.exe dist/cisco-tui-windows-x86_64.exe
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cisco-tui-windows-x86_64
+          path: dist/cisco-tui-windows-x86_64.exe
+          if-no-files-found: error
+
+  build-linux:
+    name: Linux Portable (Static MUSL)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install musl-tools for static linking
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install Rust stable toolchain with musl target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run unit tests
+        run: cargo test --target x86_64-unknown-linux-musl
+
+      - name: Build standalone static Linux binary (opt-level 3, fat LTO, no debug)
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Stage Linux portable binary and archive
+        run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/cisco-tui dist/cisco-tui-linux-x86_64
+          chmod +x dist/cisco-tui-linux-x86_64
+          tar -C dist -czf dist/cisco-tui-linux-x86_64.tar.gz cisco-tui-linux-x86_64
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cisco-tui-linux-x86_64
+          path: |
+            dist/cisco-tui-linux-x86_64
+            dist/cisco-tui-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  build-macos:
+    name: macOS Portable (Universal Intel + Apple Silicon)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain (Apple Silicon & Intel targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Apple Silicon (aarch64-apple-darwin, opt-level 3, fat LTO, no debug)
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Build Intel macOS (x86_64-apple-darwin, opt-level 3, fat LTO, no debug)
+        run: cargo build --release --target x86_64-apple-darwin
+
+      - name: Create Universal macOS binary (lipo)
+        run: |
+          mkdir -p dist
+          lipo -create -output dist/cisco-tui-macos-universal \
+            target/aarch64-apple-darwin/release/cisco-tui \
+            target/x86_64-apple-darwin/release/cisco-tui
+          chmod +x dist/cisco-tui-macos-universal
+          cp dist/cisco-tui-macos-universal dist/cisco-tui-macos-universal.command
+          chmod +x dist/cisco-tui-macos-universal.command
+          tar -C dist -czf dist/cisco-tui-macos-universal.tar.gz cisco-tui-macos-universal cisco-tui-macos-universal.command
+          (cd dist && zip -q cisco-tui-macos-universal.zip cisco-tui-macos-universal cisco-tui-macos-universal.command)
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cisco-tui-macos-universal
+          path: |
+            dist/cisco-tui-macos-universal
+            dist/cisco-tui-macos-universal.command
+            dist/cisco-tui-macos-universal.tar.gz
+            dist/cisco-tui-macos-universal.zip
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish Portable Binaries to GitHub Release
+    needs: [build-windows, build-linux, build-macos]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="latest"
+          RELEASE_TITLE="Latest Portable Builds (Windows, macOS, Linux)"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG_NAME="${GITHUB_REF#refs/tags/}"
+            RELEASE_TITLE="Cisco TUI ${TAG_NAME}"
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if [[ "${TAG_NAME}" == "latest" ]]; then
+            git tag -fa latest -m "Latest portable release build"
+            git push origin refs/tags/latest --force
+          fi
+
+          if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+            gh release upload "${TAG_NAME}" release-assets/* --clobber
+          else
+            gh release create "${TAG_NAME}" release-assets/* \
+              --title "${RELEASE_TITLE}" \
+              --notes "Standalone, zero-install portable binaries (opt-level 3, fat LTO, stripped symbols, no debug info) for Windows (.exe), macOS (Universal Intel + Apple Silicon), and Linux (static MUSL)."
+          fi

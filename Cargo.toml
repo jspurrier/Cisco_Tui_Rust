@@ -15,8 +15,14 @@ anyhow = "1.0"
 chrono = "0.4"
 
 [profile.release]
-lto = true
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+lto = "fat"
 codegen-units = 1
-strip = true
+strip = "symbols"
 panic = "abort"
+incremental = false
+
 
