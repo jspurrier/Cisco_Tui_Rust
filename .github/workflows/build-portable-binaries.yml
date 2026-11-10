@@ -153,6 +153,9 @@ jobs:
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Download all built artifacts
         uses: actions/download-artifact@v4
         with:
@@ -170,18 +173,16 @@ jobs:
             RELEASE_TITLE="Cisco TUI ${TAG_NAME}"
           fi
 
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
           if [[ "${TAG_NAME}" == "latest" ]]; then
-            git tag -fa latest -m "Latest portable release build"
-            git push origin refs/tags/latest --force
+            gh release delete "latest" --repo "${GITHUB_REPOSITORY}" --cleanup-tag --yes >/dev/null 2>&1 || true
           fi
 
-          if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
-            gh release upload "${TAG_NAME}" release-assets/* --clobber
+          if gh release view "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${TAG_NAME}" release-assets/* --repo "${GITHUB_REPOSITORY}" --clobber
           else
             gh release create "${TAG_NAME}" release-assets/* \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
               --title "${RELEASE_TITLE}" \
               --notes "Standalone, zero-install portable binaries (opt-level 3, fat LTO, stripped symbols, no debug info) for Windows (.exe), macOS (Universal Intel + Apple Silicon), and Linux (static MUSL)."
           fi
