@@ -23,6 +23,7 @@ Terminal user interface built in Rust (`ratatui`, `tokio`, `russh`) for inspecti
   - Every configuration push displays the exact CLI commands in a confirmation modal before sending.
   - On Cisco IOS-XR, if a `commit` is rejected, automatically captures `show configuration failed` and aborts the uncommitted buffer.
   - Automatic return to the Login screen when pressing `q` / `Esc` or when the router's SSH `exec-timeout` closes the session.
+  - SSH host keys are checked against `~/.ssh/known_hosts` (trust on first use); a changed key is refused. Passwords are never logged, and can be supplied through the `CISCO_TUI_PASSWORD` environment variable instead of `--pass`.
   - Built-in offline simulator (`demo` host or `--demo` flag) for testing without hardware.
 
 ## Keyboard Shortcuts
