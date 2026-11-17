@@ -58,6 +58,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 }
 
+/// Draws the top banner: connection badge, router name and OS, and interface counts.
 fn render_header_banner(frame: &mut Frame, app: &App, header_area: Rect) {
     let total_interfaces = app.interfaces.len();
     let up_interface_count = app
@@ -132,6 +133,8 @@ fn render_header_banner(frame: &mut Frame, app: &App, header_area: Rect) {
     frame.render_widget(header_paragraph, header_area);
 }
 
+/// Draws the main interface table (with the search bar above it while filtering),
+/// colouring status columns and showing each port's L2VPN binding.
 fn render_interface_table(frame: &mut Frame, app: &mut App, content_area: Rect) {
     // If a search filter is active, split a 3-line filter bar above the table
     let table_area = if app.is_filtering || !app.filter_query.is_empty() {
@@ -436,6 +439,7 @@ fn render_l2vpn_table(frame: &mut Frame, app: &mut App, content_area: Rect) {
     frame.render_stateful_widget(l2vpn_table_widget, table_area, &mut app.l2vpn_table_state);
 }
 
+/// Draws the bottom bar: the latest status message plus the shortcut keys for the current table.
 fn render_footer_bar(frame: &mut Frame, app: &App, footer_area: Rect) {
     let footer_line = if app.current_view == CurrentView::L2vpnList {
         Line::from(vec![
@@ -1378,7 +1382,7 @@ fn render_edit_l2vpn_modal(frame: &mut Frame, app: &App) {
                 Span::styled(" ( ) +SHG ", Style::default().fg(Color::DarkGray)),
                 Span::styled("( ) No SHG ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
-                    "(•) Remove (no intf)",
+                    "(•) Remove interface",
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ),
             ]),

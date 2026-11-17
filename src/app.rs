@@ -17,15 +17,25 @@ use tokio::sync::mpsc;
 /// Identifies which screen or popup modal currently has keyboard focus.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CurrentView {
+    /// Main table of interfaces and subinterfaces.
     InterfaceList,
+    /// Table of L2VPN xconnect and bridge-domain services.
     L2vpnList,
+    /// Read-only popup showing a running-config (or a failed push's error report).
     ViewConfig,
+    /// Popup form for editing or creating an interface.
     EditInterface,
+    /// Popup form for editing or creating an L2VPN service.
     EditL2vpn,
+    /// "Are you sure?" popup listing the exact commands about to be sent.
     ConfirmAction,
+    /// Login popup (host, username, password, port).
     ConnectionModal,
+    /// Popup for typing and running a free-form CLI command.
     CommandRunner,
+    /// Popup listing the session's audit log.
     ActionLogs,
+    /// Keyboard shortcut reference popup.
     Help,
 }
 
@@ -115,6 +125,9 @@ pub struct App {
 }
 
 impl App {
+    /// Creates the application state with empty tables and no router connection.
+    /// If `initial_connection_config` is given (from command-line flags), the login form
+    /// fields are pre-filled with its values.
     pub fn new(
         ssh_request_sender: mpsc::Sender<SshRequest>,
         initial_connection_config: Option<ConnectionConfig>,
@@ -264,6 +277,7 @@ impl App {
         }
     }
 
+    /// Moves the interface table selection down one row (stopping at the last row).
     pub fn next_row(&mut self) {
         let visible_count = self.filtered_interfaces().len();
         if visible_count == 0 {
@@ -277,6 +291,7 @@ impl App {
         self.selected_interface_name = self.selected_interface().map(|entry| entry.name.clone());
     }
 
+    /// Moves the interface table selection up one row (stopping at the first row).
     pub fn previous_row(&mut self) {
         let visible_count = self.filtered_interfaces().len();
         if visible_count == 0 {
@@ -290,6 +305,7 @@ impl App {
         self.selected_interface_name = self.selected_interface().map(|entry| entry.name.clone());
     }
 
+    /// Moves the interface table selection down by `page_size` rows (clamped to the last row).
     pub fn page_down(&mut self, page_size: usize) {
         let visible_count = self.filtered_interfaces().len();
         if visible_count == 0 {
@@ -301,6 +317,7 @@ impl App {
         self.selected_interface_name = self.selected_interface().map(|entry| entry.name.clone());
     }
 
+    /// Moves the interface table selection up by `page_size` rows (clamped to the first row).
     pub fn page_up(&mut self, page_size: usize) {
         let visible_count = self.filtered_interfaces().len();
         if visible_count == 0 {
@@ -312,6 +329,7 @@ impl App {
         self.selected_interface_name = self.selected_interface().map(|entry| entry.name.clone());
     }
 
+    /// Advances the interface table to the next sort column (Name, Status, Protocol, Description).
     pub fn cycle_sort(&mut self) {
         self.sort_field = match self.sort_field {
             SortField::Name => SortField::Status,
@@ -640,6 +658,9 @@ impl App {
         self.prepare_delete_subinterface_confirmation(&target_name);
     }
 
+    /// Shared helper for both delete entry points: refuses anything that is not a numbered
+    /// subinterface, otherwise builds the delete script (including any L2VPN clean-up)
+    /// and switches to the confirmation popup.
     fn prepare_delete_subinterface_confirmation(&mut self, interface_name: &str) {
         if !is_deletable_subinterface(interface_name) {
             self.status_message = format!(
@@ -732,6 +753,7 @@ impl App {
         }
     }
 
+    /// Moves the L2VPN table selection down one row (stopping at the last row).
     pub fn l2vpn_next_row(&mut self) {
         let visible_count = self.filtered_l2vpn_services().len();
         if visible_count == 0 {
@@ -743,6 +765,7 @@ impl App {
             .select(Some((current + 1).min(visible_count - 1)));
     }
 
+    /// Moves the L2VPN table selection up one row (stopping at the first row).
     pub fn l2vpn_previous_row(&mut self) {
         let visible_count = self.filtered_l2vpn_services().len();
         if visible_count == 0 {
@@ -754,6 +777,7 @@ impl App {
             .select(Some(current.saturating_sub(1)));
     }
 
+    /// Moves the L2VPN table selection down by `page_size` rows (clamped to the last row).
     pub fn l2vpn_page_down(&mut self, page_size: usize) {
         let visible_count = self.filtered_l2vpn_services().len();
         if visible_count == 0 {
@@ -764,6 +788,7 @@ impl App {
             .select(Some((current + page_size).min(visible_count - 1)));
     }
 
+    /// Moves the L2VPN table selection up by `page_size` rows (clamped to the first row).
     pub fn l2vpn_page_up(&mut self, page_size: usize) {
         let visible_count = self.filtered_l2vpn_services().len();
         if visible_count == 0 {
@@ -1203,6 +1228,9 @@ impl App {
         });
     }
 
+    /// Applies a message from the background SSH worker to the application state:
+    /// updates tables, caches, status text, the audit log, and switches screens when needed
+    /// (for example back to the login popup when the connection is lost).
     pub fn handle_ssh_response(&mut self, worker_response: SshResponse) {
         match worker_response {
             SshResponse::Connected {
@@ -1471,6 +1499,8 @@ impl App {
         }
     }
 
+    /// Appends an entry to the audit log, discarding the oldest entry once 200 are stored
+    /// so memory use stays bounded.
     pub fn add_log(&mut self, level: LogLevel, message: impl Into<String>) {
         self.logs.push(ActionLog::new(level, message));
         if self.logs.len() > 200 {

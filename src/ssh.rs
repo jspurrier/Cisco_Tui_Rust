@@ -13,35 +13,74 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// Minimal SSH client callback handler required by `russh`.
-/// Accepts router host keys so operators can connect to lab and production devices
-/// without pre-populating an external `known_hosts` file.
-struct RouterSshClientHandler;
+/// SSH client callback handler required by `russh`.
+///
+/// Verifies the router's host key against the user's standard OpenSSH `~/.ssh/known_hosts`
+/// file using "trust on first use": a host seen for the first time is remembered, and any
+/// later connection that presents a different key is refused. This protects the login
+/// password and configuration session from a machine impersonating the router.
+struct RouterSshClientHandler {
+    /// Hostname or IP address being connected to (the lookup key in `known_hosts`).
+    target_host: String,
+    /// TCP port being connected to (non-default ports are stored per host and port).
+    target_port: u16,
+}
 
 #[async_trait]
 impl client::Handler for RouterSshClientHandler {
     type Error = russh::Error;
 
+    /// Decides whether the key presented by the router is trustworthy.
+    /// Returning `Ok(false)` aborts the connection before any credentials are sent.
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh_keys::key::PublicKey,
+        server_public_key: &russh_keys::key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        Ok(true)
+        match russh_keys::check_known_hosts(
+            &self.target_host,
+            self.target_port,
+            server_public_key,
+        ) {
+            // Host is known and the key matches the stored one.
+            Ok(true) => Ok(true),
+            // Host has never been seen before: remember its key for next time.
+            // A failure to save the key (for example a read-only home directory) does not
+            // block the connection, but the host will be treated as new again next time.
+            Ok(false) => {
+                let _ = russh_keys::learn_known_hosts(
+                    &self.target_host,
+                    self.target_port,
+                    server_public_key,
+                );
+                Ok(true)
+            }
+            // The stored key differs from the presented one (possible man-in-the-middle
+            // attack, or the router was legitimately re-keyed) or the file is unreadable.
+            // Refuse the connection; the user must resolve it by editing `known_hosts`.
+            Err(_) => Ok(false),
+        }
     }
 }
 
 /// Background worker that owns the persistent SSH channel (or offline mock router)
 /// and processes requests sent from the TUI event loop.
 pub struct SshWorker {
+    /// Requests arriving from the UI thread.
     request_receiver: mpsc::Receiver<SshRequest>,
+    /// Channel used to send results back to the UI thread.
     response_sender: mpsc::Sender<SshResponse>,
+    /// Settings of the session currently open (with the detected router OS), if any.
     active_connection_config: Option<ConnectionConfig>,
+    /// The interactive shell channel on the router, if a live session is open.
     live_ssh_channel: Option<Channel<client::Msg>>,
+    /// The underlying SSH connection; kept alive so the channel stays usable.
     live_ssh_session: Option<Handle<RouterSshClientHandler>>,
+    /// The simulated router, if the demo mode is active instead of a live session.
     mock_router: Option<MockCiscoRouter>,
 }
 
 impl SshWorker {
+    /// Creates a worker that is not yet connected to any router.
     pub fn new(
         request_receiver: mpsc::Receiver<SshRequest>,
         response_sender: mpsc::Sender<SshResponse>,
@@ -77,10 +116,10 @@ impl SshWorker {
                             }
                             Some(ChannelMsg::Data { ref data }) => {
                                 let text = String::from_utf8_lossy(data);
-                                let lower = text.to_lowercase();
-                                if lower.contains("timeout")
-                                    || lower.contains("idle")
-                                    || lower.contains("connection closed")
+                                let lowercase_text = text.to_lowercase();
+                                if lowercase_text.contains("timeout")
+                                    || lowercase_text.contains("idle")
+                                    || lowercase_text.contains("connection closed")
                                 {
                                     self.close_current_session().await;
                                     let _ = self
@@ -194,7 +233,10 @@ impl SshWorker {
         let connect_future = client::connect(
             ssh_client_config,
             (&connection_config.host[..], connection_config.port),
-            RouterSshClientHandler,
+            RouterSshClientHandler {
+                target_host: connection_config.host.clone(),
+                target_port: connection_config.port,
+            },
         );
 
         let connection_attempt =
@@ -318,11 +360,18 @@ impl SshWorker {
                 }
             }
             Ok(Err(connect_error)) => {
+                // A rejected host key surfaces as `UnknownKey`; explain it, since the raw
+                // error text gives the operator no hint about how to fix it.
+                let failure_reason = if matches!(connect_error, russh::Error::UnknownKey) {
+                    "host key does not match ~/.ssh/known_hosts (possible impersonation, or the router was re-keyed; remove the old entry only if you trust the change)".to_string()
+                } else {
+                    connect_error.to_string()
+                };
                 let _ = self
                     .response_sender
                     .send(SshResponse::ConnectionError(format!(
                         "Unable to connect to {}:{}: {}",
-                        connection_config.host, connection_config.port, connect_error
+                        connection_config.host, connection_config.port, failure_reason
                     )))
                     .await;
             }
@@ -812,13 +861,20 @@ fn ends_with_cisco_prompt(output_text: &str) -> bool {
         && (trimmed_prompt.ends_with('#') || trimmed_prompt.ends_with('>'))
 }
 
+/// An in-memory fake router used by the offline demo mode. It holds made-up interfaces
+/// (using documentation-reserved IP ranges only) and applies pushed configuration to
+/// them so the whole interface can be tried without any real hardware.
 struct MockCiscoRouter {
+    /// CLI dialect the fake router pretends to speak.
     operating_system: CiscoOs,
+    /// Interface table rows, as `show interfaces description` would list them.
     interfaces: Vec<InterfaceEntry>,
+    /// Per-interface running-config text, keyed by interface name.
     running_configs: HashMap<String, String>,
 }
 
 impl MockCiscoRouter {
+    /// Builds the fake router with its fixed set of sample interfaces and configurations.
     fn new(operating_system: CiscoOs) -> Self {
         let initial_interfaces = vec![
             InterfaceEntry {
@@ -966,10 +1022,13 @@ impl MockCiscoRouter {
         }
     }
 
+    /// Returns a copy of the fake router's interface table.
     fn get_interfaces(&self) -> Vec<InterfaceEntry> {
         self.interfaces.clone()
     }
 
+    /// Returns sample L2VPN services by parsing a fixed `show running-config l2vpn` text,
+    /// which also exercises the real parser in demo mode.
     fn get_l2vpn_services(&self) -> Vec<L2vpnServiceEntry> {
         let sample_l2vpn = r#"l2vpn
  load-balancing flow src-dst-ip
@@ -1007,6 +1066,8 @@ impl MockCiscoRouter {
         parse_running_config_l2vpn(sample_l2vpn)
     }
 
+    /// Returns the running-config stanza for one interface, inventing a plausible one
+    /// from the interface table if no stanza was stored.
     fn get_config(&self, interface_name: &str) -> String {
         if let Some(existing_config) = self.running_configs.get(interface_name) {
             return existing_config.clone();
@@ -1050,6 +1111,8 @@ impl MockCiscoRouter {
         config_lines.join("\n")
     }
 
+    /// Applies a configuration script to the fake router (creating, deleting, or changing
+    /// interfaces) and returns a transcript that looks like a real commit.
     fn execute_config(&mut self, commands: &[String]) -> String {
         let mut target_interface_name: Option<String> = None;
         let mut is_l2transport_mode = false;
@@ -1177,6 +1240,7 @@ impl MockCiscoRouter {
         }
     }
 
+    /// Returns canned output for a few common `show` commands, or a generic acknowledgement.
     fn run_command(&self, command_text: &str) -> String {
         let lowercase_command = command_text.trim().to_lowercase();
         if lowercase_command.contains("show ip int brief")

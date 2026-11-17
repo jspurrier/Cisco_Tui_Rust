@@ -6,7 +6,7 @@ mod ui;
 
 use app::{App, CurrentView};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -105,7 +105,9 @@ OPTIONS:
     --host <HOST>       Router hostname or IP address
     --port <PORT>       SSH port (default: 22)
     --user <USERNAME>   SSH username
-    --pass <PASSWORD>   SSH password
+    --pass <PASSWORD>   SSH password (visible in the process list and shell history;
+                        prefer the CISCO_TUI_PASSWORD environment variable or the
+                        interactive login screen)
     --os <ios|ios-xr>   Initial Cisco OS mode: 'ios' (IOS/IOS-XE) or 'ios-xr' (default: ios-xr)
     --demo, --mock      Start in offline simulated router mode
     -h, --help          Print this help message
@@ -139,7 +141,9 @@ fn parse_command_line_arguments() -> (Option<ConnectionConfig>, bool) {
     let mut target_host: Option<String> = None;
     let mut ssh_port: u16 = 22;
     let mut ssh_username: Option<String> = None;
-    let mut ssh_password: Option<String> = None;
+    // The password may come from the environment so it never appears in the process list;
+    // an explicit `--pass` flag (parsed below) overrides it.
+    let mut ssh_password: Option<String> = env::var("CISCO_TUI_PASSWORD").ok();
     let mut operating_system = CiscoOs::IosXr;
     let mut use_mock_router = false;
 
@@ -218,6 +222,9 @@ fn parse_command_line_arguments() -> (Option<ConnectionConfig>, bool) {
     }
 }
 
+/// Program entry point: starts the background SSH worker, opens the login popup (or connects
+/// straight away if command-line flags supplied a host and user), then runs the draw-and-input
+/// loop until the user quits. The terminal is always restored before exit.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (initial_connection_config, should_auto_connect) = parse_command_line_arguments();
@@ -254,6 +261,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize terminal raw mode and alternate screen buffer
     enable_raw_mode()?;
+
+    // If the program ever panics, put the terminal back into its normal mode first so the
+    // user's shell is not left in raw mode on the alternate screen with an unreadable message.
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_information| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        default_panic_hook(panic_information);
+    }));
+
     let mut stdout_handle = io::stdout();
     execute!(stdout_handle, EnterAlternateScreen)?;
     let terminal_backend = CrosstermBackend::new(stdout_handle);
@@ -275,7 +292,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key_event) = event::read()? {
-                handle_keyboard_input(&mut app, key_event);
+                // Windows terminals report both a key-press and a key-release event for every
+                // physical keystroke, while Linux and macOS report only the press. Handling the
+                // release as well made every character (or Enter) register twice on Windows,
+                // so only key presses (and auto-repeat while held) are processed.
+                if key_event.kind != KeyEventKind::Release {
+                    handle_keyboard_input(&mut app, key_event);
+                }
             }
         }
     }

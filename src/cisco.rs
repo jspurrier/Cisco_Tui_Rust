@@ -493,16 +493,25 @@ pub fn normalize_ip_spec(raw_ip_input: &str) -> String {
 /// Structured fields extracted from an existing `show running-config interface` stanza.
 #[derive(Clone, Debug, Default)]
 pub struct ParsedInterfaceConfig {
+    /// Text after `description`, or empty when none is configured.
     pub description: String,
+    /// `true` unless the stanza contains `shutdown`.
     pub port_enabled: bool,
+    /// `true` if the stanza literally contains `shutdown` or `no shutdown` (subinterfaces often omit both).
     pub has_explicit_shutdown_state: bool,
+    /// Primary IPv4 address in `<ip>/<prefix>` form, or empty.
     pub primary_ip: String,
+    /// Secondary IPv4 addresses in `<ip>/<prefix>` form, comma separated, or empty.
     pub secondary_ip: String,
+    /// `true` if the interface is an `l2transport` subinterface.
     pub l2transport: bool,
+    /// Outer 802.1Q VLAN ID from `encapsulation dot1q`, or empty.
     pub vlan_id: String,
+    /// Inner VLAN ID from `second-dot1q` (QinQ), or empty.
     pub second_vlan_id: String,
     /// Number of VLAN tags popped on ingress (`0` = none, `1` = `pop 1 symmetric`, `2` = `pop 2 symmetric`).
     pub rewrite_ingress_pop: u8,
+    /// Configured `mtu` in bytes, or empty when not set.
     pub mtu: String,
     /// Whether `negotiation auto` is configured on the port (`false` by default).
     pub negotiation_auto: bool,
@@ -595,19 +604,28 @@ pub fn parse_interface_running_config(running_config_text: &str) -> ParsedInterf
 /// and modified/removed settings emit proper `no ...` negation statements first.
 #[derive(Clone, Debug, Default)]
 pub struct InterfaceEditorForm {
+    /// Interface name being edited or created (for example `Gi0/0/0/1.100`).
     pub interface: String,
+    /// Description text to configure.
     pub description: String,
+    /// `true` for `no shutdown`, `false` for `shutdown` (ignored when `omit_port_state` is set).
     pub port_enabled: bool,
     /// When `true` (the default for `.vlan` subinterfaces), neither `no shutdown` nor `shutdown`
     /// is written in the CLI commands so the subport inherits its state from the parent port.
     pub omit_port_state: bool,
+    /// Primary IPv4 address, as `<ip>/<prefix>` or `<ip> <netmask>`.
     pub primary_ip: String,
+    /// Secondary IPv4 addresses, comma separated, in the same formats as the primary.
     pub secondary_ip: String,
+    /// `true` to configure the port as `l2transport`, `false` for a routed (layer 3) port.
     pub l2transport: bool,
+    /// Outer 802.1Q VLAN ID (empty for none).
     pub vlan_id: String,
+    /// Inner VLAN ID for double-tagged QinQ circuits (empty for single tag).
     pub second_vlan_id: String,
     /// Number of VLAN tags popped on ingress (`0` = none, `1` = `pop 1 symmetric`, `2` = `pop 2 symmetric`).
     pub rewrite_ingress_pop: u8,
+    /// Jumbo MTU in bytes (empty to leave unset).
     pub mtu: String,
     /// Whether `negotiation auto` is enabled (`false` by default; usually omitted unless needed).
     pub negotiation_auto: bool,
@@ -1671,9 +1689,9 @@ mod tests {
 RP/0/RSP0/CPU0:Router#show interfaces description
 Interface          Status          Protocol    Description
 --------------------------------------------------------------------------------
-Te0/0/0/0          up              up          Transit Provider Level3
+Te0/0/0/0          up              up          Transit Provider Example
 Te0/0/0/1          admin down      down        Maintenance Reserved
-Te0/0/0/2.100      up              up          Cust: Acme L2Transport
+Te0/0/0/2.100      up              up          Cust: Example L2Transport
 Bundle-Ether1      up              up          LAG-Core-Spine
 Loopback0          up              up          Router-ID BGP
 Nu0                up              up          
@@ -1684,7 +1702,7 @@ RP/0/RSP0/CPU0:Router#
         assert_eq!(parsed_entries[0].name, "Te0/0/0/0");
         assert_eq!(parsed_entries[0].status, "up");
         assert_eq!(parsed_entries[0].protocol, "up");
-        assert_eq!(parsed_entries[0].description, "Transit Provider Level3");
+        assert_eq!(parsed_entries[0].description, "Transit Provider Example");
 
         assert_eq!(parsed_entries[1].name, "Te0/0/0/1");
         assert_eq!(parsed_entries[1].status, "admin down");
@@ -1721,7 +1739,7 @@ Router#
         let generated_script = build_l2transport_script(
             "TenGigE0/0/0/1.100",
             "100",
-            "Customer XYZ L2VPN",
+            "Example Customer L2VPN",
             true,
             Some("9216"),
             true,
@@ -1763,13 +1781,13 @@ Router#
     #[test]
     fn test_build_description() {
         let update_script =
-            build_description_script("TenGigE0/0/0/0", "Transit to Level3", CiscoOs::IosXr);
+            build_description_script("TenGigE0/0/0/0", "Transit to Example", CiscoOs::IosXr);
         assert_eq!(
             update_script,
             vec![
                 "configure terminal",
                 "interface TenGigE0/0/0/0",
-                "description Transit to Level3",
+                "description Transit to Example",
                 "commit",
                 "end"
             ]
