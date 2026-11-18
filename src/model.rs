@@ -226,6 +226,44 @@ pub struct L2vpnServiceEntry {
     pub raw_stanza: String,
 }
 
+/// Service forwarding binding inside a Cisco IOS-XE / ASR 900 `service instance <id> ethernet`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ServiceInstanceBinding {
+    #[default]
+    None,
+    /// Point-to-point EoMPLS pseudowire (`xconnect <peer_ipv4> <pw_id> encapsulation mpls`).
+    Xconnect,
+    /// Multipoint bridge domain (`bridge-domain <bd_id>`).
+    BridgeDomain,
+}
+
+/// Ethernet Service Instance (`service instance <id> ethernet`) parsed from an IOS-XE / ASR 900 interface.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ServiceInstanceEntry {
+    /// Parent physical or Port-channel interface (for example `"TenGigabitEthernet0/0/0"`).
+    pub parent_interface: String,
+    /// Numeric service instance ID (for example `"100"`).
+    pub service_instance_id: String,
+    /// Optional description inside the service instance.
+    pub description: String,
+    /// Outer Dot1Q VLAN ID (or `"untagged"` / `"default"` if configured).
+    pub vlan_id: String,
+    /// Optional inner Dot1Q VLAN ID (`second-dot1q`).
+    pub second_vlan_id: String,
+    /// Number of VLAN tags popped on ingress (`0` = none, `1` = `pop 1 symmetric`, `2` = `pop 2 symmetric`).
+    pub rewrite_ingress_pop: u8,
+    /// Forwarding binding (`None`, `Xconnect`, or `BridgeDomain`).
+    pub binding_type: ServiceInstanceBinding,
+    /// Peer IPv4 address for `xconnect <peer_ipv4> <pw_id> encapsulation mpls`.
+    pub xconnect_peer_ip: String,
+    /// Pseudowire VC ID for `xconnect`.
+    pub xconnect_pw_id: String,
+    /// Bridge-domain ID for `bridge-domain <id>`.
+    pub bridge_domain_id: String,
+    /// Whether `split-horizon` is appended to `bridge-domain <id>`.
+    pub split_horizon: bool,
+}
+
 /// Asynchronous requests sent from the TUI thread to the background SSH worker.
 #[derive(Debug)]
 pub enum SshRequest {
@@ -273,6 +311,8 @@ pub enum SshResponse {
     Interfaces(Result<Vec<InterfaceEntry>, String>),
     /// Result of an L2VPN poll (`Err` holds a readable reason).
     L2vpnServices(Result<Vec<L2vpnServiceEntry>, String>),
+    /// Result of an IOS-XE / ASR 900 service instance poll (`Err` holds a readable reason).
+    ServiceInstances(Result<Vec<ServiceInstanceEntry>, String>),
     /// Result of reading one interface's running-config.
     ConfigResult {
         /// Interface the result belongs to.

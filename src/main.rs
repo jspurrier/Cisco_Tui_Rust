@@ -10,7 +10,9 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use model::{CiscoOs, ConnectionConfig, L2vpnServiceType, SshRequest, SshResponse};
+use model::{
+    CiscoOs, ConnectionConfig, L2vpnServiceType, ServiceInstanceBinding, SshRequest, SshResponse,
+};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use ssh::SshWorker;
 use std::env;
@@ -364,8 +366,20 @@ fn handle_keyboard_input(app: &mut App, key_event: event::KeyEvent) {
                     KeyCode::Char('n') | KeyCode::Char('a') | KeyCode::Char('l') => {
                         app.initiate_add_subinterface()
                     }
-                    KeyCode::Char('b') => app.initiate_edit_l2vpn_for_selected_interface(false),
-                    KeyCode::Char('w') => app.current_view = CurrentView::L2vpnList,
+                    KeyCode::Char('b') => {
+                        if app.connected_os == CiscoOs::Ios {
+                            app.initiate_edit_service_instance_for_selected_interface(false);
+                        } else {
+                            app.initiate_edit_l2vpn_for_selected_interface(false);
+                        }
+                    }
+                    KeyCode::Char('w') => {
+                        if app.connected_os == CiscoOs::Ios {
+                            app.current_view = CurrentView::ServiceInstanceList;
+                        } else {
+                            app.current_view = CurrentView::L2vpnList;
+                        }
+                    }
                     KeyCode::Char('x') | KeyCode::Delete => app.initiate_delete_subinterface(),
                     KeyCode::Char('u') => app.initiate_no_shutdown(),
                     KeyCode::Char('d') => app.initiate_shutdown(),
@@ -477,6 +491,79 @@ fn handle_keyboard_input(app: &mut App, key_event: event::KeyEvent) {
             }
         }
 
+        // Dedicated IOS-XE / ASR 900 Service Instances Table View (`w`)
+        CurrentView::ServiceInstanceList => {
+            if app.service_instance_is_filtering {
+                match key_event.code {
+                    KeyCode::Esc => {
+                        app.service_instance_is_filtering = false;
+                        app.service_instance_filter_query.clear();
+                    }
+                    KeyCode::Enter => {
+                        app.service_instance_is_filtering = false;
+                    }
+                    KeyCode::Backspace => {
+                        app.service_instance_filter_query.pop();
+                    }
+                    KeyCode::Char(typed_char) => {
+                        app.service_instance_filter_query.push(typed_char);
+                    }
+                    _ => {}
+                }
+            } else {
+                match key_event.code {
+                    KeyCode::Char('q') => {
+                        if app.is_connected {
+                            app.disconnect_to_login_modal();
+                        } else {
+                            app.should_quit = true;
+                        }
+                    }
+                    KeyCode::Char('w') => app.current_view = CurrentView::InterfaceList,
+                    KeyCode::Esc => {
+                        if !app.service_instance_filter_query.is_empty() {
+                            app.service_instance_filter_query.clear();
+                        } else {
+                            app.current_view = CurrentView::InterfaceList;
+                        }
+                    }
+                    KeyCode::Char('/') => {
+                        app.service_instance_is_filtering = true;
+                    }
+                    KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char('b') => {
+                        app.initiate_edit_selected_service_instance()
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('a') => {
+                        app.initiate_add_service_instance()
+                    }
+                    KeyCode::Char('x') | KeyCode::Delete => {
+                        app.initiate_delete_selected_service_instance()
+                    }
+                    KeyCode::Char('r') => app.refresh_l2vpn(),
+                    KeyCode::Char(':') => app.current_view = CurrentView::CommandRunner,
+                    KeyCode::Char('L') => app.current_view = CurrentView::ActionLogs,
+                    KeyCode::Char('?') => app.current_view = CurrentView::Help,
+                    KeyCode::Down | KeyCode::Char('j') => app.service_instance_next_row(),
+                    KeyCode::Up | KeyCode::Char('k') => app.service_instance_previous_row(),
+                    KeyCode::PageDown => app.service_instance_page_down(10),
+                    KeyCode::PageUp => app.service_instance_page_up(10),
+                    KeyCode::Home => {
+                        if !app.filtered_service_instances().is_empty() {
+                            app.service_instance_table_state.select(Some(0));
+                        }
+                    }
+                    KeyCode::End => {
+                        let visible_count = app.filtered_service_instances().len();
+                        if visible_count > 0 {
+                            app.service_instance_table_state
+                                .select(Some(visible_count - 1));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // -------------------------------------------------------------------
         // Read-Only Running Configuration Viewer Modal
         // -------------------------------------------------------------------
@@ -523,7 +610,11 @@ fn handle_keyboard_input(app: &mut App, key_event: event::KeyEvent) {
             if key_event.modifiers.contains(KeyModifiers::CONTROL)
                 && (key_event.code == KeyCode::Char('w') || key_event.code == KeyCode::Char('b'))
             {
-                app.initiate_edit_l2vpn_for_selected_interface(true);
+                if app.connected_os == CiscoOs::Ios {
+                    app.initiate_edit_service_instance_for_selected_interface(true);
+                } else {
+                    app.initiate_edit_l2vpn_for_selected_interface(true);
+                }
                 return;
             }
 
@@ -816,6 +907,160 @@ fn handle_keyboard_input(app: &mut App, key_event: event::KeyEvent) {
         }
 
         // -------------------------------------------------------------------
+        // IOS-XE / ASR 900 Ethernet Service Instance Editor Modal (9 fields, 0..=8)
+        CurrentView::EditServiceInstance => match key_event.code {
+            KeyCode::Esc => {
+                if app.previous_view == CurrentView::ServiceInstanceList {
+                    app.current_view = CurrentView::ServiceInstanceList;
+                } else if app.previous_view == CurrentView::EditInterface {
+                    app.current_view = CurrentView::EditInterface;
+                } else {
+                    app.current_view = CurrentView::InterfaceList;
+                }
+            }
+            KeyCode::Tab | KeyCode::Right => {
+                app.service_instance_active_field = (app.service_instance_active_field + 1) % 9;
+            }
+            KeyCode::BackTab | KeyCode::Left => {
+                app.service_instance_active_field = if app.service_instance_active_field == 0 {
+                    8
+                } else {
+                    app.service_instance_active_field - 1
+                };
+            }
+            KeyCode::Down => {
+                app.service_instance_active_field = match app.service_instance_active_field {
+                    0 | 1 => 2,
+                    2 => 3,
+                    3 => 6,
+                    4 => 7,
+                    5 => 8,
+                    6 => 0,
+                    7 | 8 => 1,
+                    _ => 0,
+                };
+            }
+            KeyCode::Up => {
+                app.service_instance_active_field = match app.service_instance_active_field {
+                    0 => 6,
+                    1 => 7,
+                    2 => 0,
+                    3 | 4 | 5 => 2,
+                    6 => 3,
+                    7 => 4,
+                    8 => 5,
+                    _ => 0,
+                };
+            }
+            KeyCode::Char(' ') => match app.service_instance_active_field {
+                0 => app.cycle_service_instance_parent_interface(),
+                2 => app.service_instance_form.description.push(' '),
+                5 => {
+                    app.service_instance_form.rewrite_ingress_pop =
+                        match app.service_instance_form.rewrite_ingress_pop {
+                            1 => 2,
+                            2 => 0,
+                            _ => 1,
+                        };
+                }
+                6 => {
+                    app.service_instance_form.binding_type =
+                        match app.service_instance_form.binding_type {
+                            ServiceInstanceBinding::Xconnect => {
+                                ServiceInstanceBinding::BridgeDomain
+                            }
+                            ServiceInstanceBinding::BridgeDomain => ServiceInstanceBinding::None,
+                            ServiceInstanceBinding::None => ServiceInstanceBinding::Xconnect,
+                        };
+                }
+                8 if app.service_instance_form.binding_type
+                    == ServiceInstanceBinding::BridgeDomain =>
+                {
+                    app.service_instance_form.split_horizon =
+                        !app.service_instance_form.split_horizon;
+                }
+                _ => {}
+            },
+            KeyCode::Backspace => match app.service_instance_active_field {
+                0 => {
+                    app.service_instance_form.parent_interface.pop();
+                }
+                1 => {
+                    app.service_instance_form.service_instance_id.pop();
+                }
+                2 => {
+                    app.service_instance_form.description.pop();
+                }
+                3 => {
+                    app.service_instance_form.vlan_id.pop();
+                }
+                4 => {
+                    app.service_instance_form.second_vlan_id.pop();
+                    if app.service_instance_form.second_vlan_id.is_empty()
+                        && app.service_instance_form.rewrite_ingress_pop == 2
+                    {
+                        app.service_instance_form.rewrite_ingress_pop = 1;
+                    }
+                }
+                7 => match app.service_instance_form.binding_type {
+                    ServiceInstanceBinding::Xconnect => {
+                        app.service_instance_form.xconnect_peer_ip.pop();
+                    }
+                    ServiceInstanceBinding::BridgeDomain => {
+                        app.service_instance_form.bridge_domain_id.pop();
+                    }
+                    ServiceInstanceBinding::None => {}
+                },
+                8 if app.service_instance_form.binding_type == ServiceInstanceBinding::Xconnect => {
+                    app.service_instance_form.xconnect_pw_id.pop();
+                }
+                _ => {}
+            },
+            KeyCode::Char(typed_char) => match app.service_instance_active_field {
+                0 => app.service_instance_form.parent_interface.push(typed_char),
+                1 => {
+                    if typed_char.is_ascii_digit() {
+                        app.service_instance_form
+                            .service_instance_id
+                            .push(typed_char);
+                    }
+                }
+                2 => app.service_instance_form.description.push(typed_char),
+                3 => {
+                    if typed_char.is_ascii_digit() {
+                        app.service_instance_form.vlan_id.push(typed_char);
+                    }
+                }
+                4 => {
+                    if typed_char.is_ascii_digit() {
+                        app.service_instance_form.second_vlan_id.push(typed_char);
+                        if app.service_instance_form.rewrite_ingress_pop == 1 {
+                            app.service_instance_form.rewrite_ingress_pop = 2;
+                        }
+                    }
+                }
+                7 => match app.service_instance_form.binding_type {
+                    ServiceInstanceBinding::Xconnect => {
+                        app.service_instance_form.xconnect_peer_ip.push(typed_char);
+                    }
+                    ServiceInstanceBinding::BridgeDomain => {
+                        if typed_char.is_ascii_digit() {
+                            app.service_instance_form.bridge_domain_id.push(typed_char);
+                        }
+                    }
+                    ServiceInstanceBinding::None => {}
+                },
+                8 if app.service_instance_form.binding_type == ServiceInstanceBinding::Xconnect => {
+                    if typed_char.is_ascii_digit() {
+                        app.service_instance_form.xconnect_pw_id.push(typed_char);
+                    }
+                }
+                _ => {}
+            },
+            KeyCode::Enter => app.confirm_service_instance_form(),
+            _ => {}
+        },
+
         // Configuration Push Confirmation Modal
         // -------------------------------------------------------------------
         CurrentView::ConfirmAction => match key_event.code {

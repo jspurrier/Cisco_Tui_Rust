@@ -1,9 +1,10 @@
 use crate::cisco::{
-    clean_cisco_output, has_ios_xr_interface_naming, parse_running_config_l2vpn,
-    parse_show_interfaces_description, sanitize_pty_output,
+    clean_cisco_output, has_ios_xr_interface_naming, parse_ios_xe_service_instances,
+    parse_running_config_l2vpn, parse_show_interfaces_description, sanitize_pty_output,
 };
 use crate::model::{
-    CiscoOs, ConnectionConfig, InterfaceEntry, L2vpnServiceEntry, SshRequest, SshResponse,
+    CiscoOs, ConnectionConfig, InterfaceEntry, L2vpnServiceEntry, ServiceInstanceEntry, SshRequest,
+    SshResponse,
 };
 use async_trait::async_trait;
 use russh::client::{self, Handle};
@@ -442,14 +443,22 @@ impl SshWorker {
         self.handle_fetch_l2vpn().await;
     }
 
-    /// Queries `show running-config l2vpn` from the router and returns all parsed Xconnects & Bridge-Domains.
+    /// Queries `show running-config l2vpn` (IOS-XR) or `show running-config | section ^interface` (IOS-XE / ASR 900).
     async fn handle_fetch_l2vpn(&mut self) {
         if let Some(simulated_router) = &self.mock_router {
-            let services = simulated_router.get_l2vpn_services();
-            let _ = self
-                .response_sender
-                .send(SshResponse::L2vpnServices(Ok(services)))
-                .await;
+            if simulated_router.operating_system == CiscoOs::Ios {
+                let instances = simulated_router.get_service_instances();
+                let _ = self
+                    .response_sender
+                    .send(SshResponse::ServiceInstances(Ok(instances)))
+                    .await;
+            } else {
+                let services = simulated_router.get_l2vpn_services();
+                let _ = self
+                    .response_sender
+                    .send(SshResponse::L2vpnServices(Ok(services)))
+                    .await;
+            }
             return;
         }
 
@@ -471,25 +480,51 @@ impl SshWorker {
             tokio::time::timeout(Duration::from_millis(20), ssh_channel.wait()).await
         {}
 
-        let command_text = "show running-config l2vpn\n";
-        if let Err(send_error) = ssh_channel.data(command_text.as_bytes()).await {
+        let is_ios_xe = self
+            .active_connection_config
+            .as_ref()
+            .map_or(false, |config| config.operating_system == CiscoOs::Ios);
+
+        if is_ios_xe {
+            let command_text = "show running-config | section ^interface\n";
+            if let Err(send_error) = ssh_channel.data(command_text.as_bytes()).await {
+                let _ = self
+                    .response_sender
+                    .send(SshResponse::ServiceInstances(Err(format!(
+                        "Failed to send command: {}",
+                        send_error
+                    ))))
+                    .await;
+                return;
+            }
+
+            let raw_output = read_channel_until_prompt_or_quiet(ssh_channel, 3000).await;
+            let parsed_instances = parse_ios_xe_service_instances(&raw_output);
             let _ = self
                 .response_sender
-                .send(SshResponse::L2vpnServices(Err(format!(
-                    "Failed to send command: {}",
-                    send_error
-                ))))
+                .send(SshResponse::ServiceInstances(Ok(parsed_instances)))
                 .await;
-            return;
+        } else {
+            let command_text = "show running-config l2vpn\n";
+            if let Err(send_error) = ssh_channel.data(command_text.as_bytes()).await {
+                let _ = self
+                    .response_sender
+                    .send(SshResponse::L2vpnServices(Err(format!(
+                        "Failed to send command: {}",
+                        send_error
+                    ))))
+                    .await;
+                return;
+            }
+
+            let raw_output = read_channel_until_prompt_or_quiet(ssh_channel, 2500).await;
+            let parsed_services = parse_running_config_l2vpn(&raw_output);
+
+            let _ = self
+                .response_sender
+                .send(SshResponse::L2vpnServices(Ok(parsed_services)))
+                .await;
         }
-
-        let raw_output = read_channel_until_prompt_or_quiet(ssh_channel, 2500).await;
-        let parsed_services = parse_running_config_l2vpn(&raw_output);
-
-        let _ = self
-            .response_sender
-            .send(SshResponse::L2vpnServices(Ok(parsed_services)))
-            .await;
     }
 
     /// Queries `show running-config interface <name>` for a specific port.
@@ -876,6 +911,92 @@ struct MockCiscoRouter {
 impl MockCiscoRouter {
     /// Builds the fake router with its fixed set of sample interfaces and configurations.
     fn new(operating_system: CiscoOs) -> Self {
+        if operating_system == CiscoOs::Ios {
+            let initial_interfaces = vec![
+                InterfaceEntry {
+                    name: "TenGigabitEthernet0/0/0".to_string(),
+                    status: "up".to_string(),
+                    protocol: "up".to_string(),
+                    description: "CUSTOMER-TRUNK-01".to_string(),
+                },
+                InterfaceEntry {
+                    name: "TenGigabitEthernet0/0/1".to_string(),
+                    status: "up".to_string(),
+                    protocol: "up".to_string(),
+                    description: "METRO-ACCESS-RING".to_string(),
+                },
+                InterfaceEntry {
+                    name: "GigabitEthernet0/0/0".to_string(),
+                    status: "admin down".to_string(),
+                    protocol: "down".to_string(),
+                    description: "SPARE-1G-PORT".to_string(),
+                },
+                InterfaceEntry {
+                    name: "BDI10".to_string(),
+                    status: "up".to_string(),
+                    protocol: "up".to_string(),
+                    description: "CUSTOMER-GATEWAY-BDI10".to_string(),
+                },
+                InterfaceEntry {
+                    name: "Loopback0".to_string(),
+                    status: "up".to_string(),
+                    protocol: "up".to_string(),
+                    description: "ROUTER-ID".to_string(),
+                },
+            ];
+
+            let mut running_configs = HashMap::new();
+            running_configs.insert(
+                "TenGigabitEthernet0/0/0".to_string(),
+                r#"interface TenGigabitEthernet0/0/0
+ description CUSTOMER-TRUNK-01
+ mtu 9100
+ no ip address
+ service instance 100 ethernet
+  description Customer Site A Primary
+  encapsulation dot1q 100
+  rewrite ingress tag pop 1 symmetric
+  xconnect 192.0.2.10 100 encapsulation mpls
+ !
+ service instance 200 ethernet
+  description Customer Site A Backup
+  encapsulation dot1q 200
+  rewrite ingress tag pop 1 symmetric
+  xconnect 192.0.2.20 200 encapsulation mpls
+ !
+!"#
+                .to_string(),
+            );
+            running_configs.insert(
+                "TenGigabitEthernet0/0/1".to_string(),
+                r#"interface TenGigabitEthernet0/0/1
+ description METRO-ACCESS-RING
+ no ip address
+ service instance 10 ethernet
+  description Metro Bridge Domain 10
+  encapsulation dot1q 10
+  rewrite ingress tag pop 1 symmetric
+  bridge-domain 10
+ !
+!"#
+                .to_string(),
+            );
+            running_configs.insert(
+                "BDI10".to_string(),
+                r#"interface BDI10
+ description CUSTOMER-GATEWAY-BDI10
+ ip address 198.51.100.1 255.255.255.0
+!"#
+                .to_string(),
+            );
+
+            return Self {
+                operating_system,
+                interfaces: initial_interfaces,
+                running_configs,
+            };
+        }
+
         let initial_interfaces = vec![
             InterfaceEntry {
                 name: "GigabitEthernet0/0/0/0".to_string(),
@@ -1025,6 +1146,17 @@ impl MockCiscoRouter {
     /// Returns a copy of the fake router's interface table.
     fn get_interfaces(&self) -> Vec<InterfaceEntry> {
         self.interfaces.clone()
+    }
+
+    /// Parses IOS-XE / ASR 900 `service instance` stanzas from the mock router's running configs.
+    fn get_service_instances(&self) -> Vec<ServiceInstanceEntry> {
+        let combined = self
+            .running_configs
+            .values()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        parse_ios_xe_service_instances(&combined)
     }
 
     /// Returns sample L2VPN services by parsing a fixed `show running-config l2vpn` text,

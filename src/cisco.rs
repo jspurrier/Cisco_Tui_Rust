@@ -1,6 +1,6 @@
 use crate::model::{
     CiscoOs, InterfaceEntry, L2vpnAttachmentInterface, L2vpnPseudowireNeighbor, L2vpnServiceEntry,
-    L2vpnServiceType,
+    L2vpnServiceType, ServiceInstanceBinding, ServiceInstanceEntry,
 };
 
 /// Parses the output of `show interfaces description` from Cisco IOS, IOS-XE, or IOS-XR.
@@ -937,7 +937,9 @@ pub fn expand_full_interface_name(raw_name: &str) -> String {
         "gi" | "gig" | "gige" | "gigabitethernet" => Some("GigabitEthernet"),
         "te" | "ten" | "tengig" | "tengige" | "tengigabitethernet" => Some("TenGigE"),
         "be" | "bundle-ether" | "bundle" => Some("Bundle-Ether"),
+        "po" | "port-channel" => Some("Port-channel"),
         "bv" | "bvi" => Some("BVI"),
+        "bdi" => Some("BDI"),
         "hu" | "hun" | "hundredgige" => Some("HundredGigE"),
         "tf" | "twentyfivegige" => Some("TwentyFiveGigE"),
         "fo" | "fortygige" => Some("FortyGigE"),
@@ -954,6 +956,18 @@ pub fn expand_full_interface_name(raw_name: &str) -> String {
     }
 }
 
+/// Expands an interface name using the canonical naming for the active Cisco OS
+/// (for example `Te0/0/0` -> `TenGigabitEthernet0/0/0` on IOS-XE, `TenGigE0/0/0/0` on IOS-XR).
+pub fn expand_interface_name_for_os(raw_name: &str, operating_system: CiscoOs) -> String {
+    let expanded = expand_full_interface_name(raw_name);
+    if operating_system == CiscoOs::Ios {
+        if let Some(suffix) = expanded.strip_prefix("TenGigE") {
+            return format!("TenGigabitEthernet{}", suffix);
+        }
+    }
+    expanded
+}
+
 /// Converts a full or arbitrarily-cased Cisco interface name into its compact 2-letter table abbreviation
 /// (e.g. `GigabitEthernet0/0/0/1.100` or `GI0/0/0/1.100` -> `Gi0/0/0/1.100`, `Bundle-Ether10.100` -> `BE10.100`).
 pub fn abbreviate_interface_name(raw_name: &str) -> String {
@@ -968,6 +982,8 @@ pub fn abbreviate_interface_name(raw_name: &str) -> String {
         "gi" | "gig" | "gige" | "gigabitethernet" => Some("Gi"),
         "te" | "ten" | "tengig" | "tengige" | "tengigabitethernet" => Some("Te"),
         "be" | "bundle-ether" | "bundle" => Some("BE"),
+        "po" | "port-channel" => Some("Po"),
+        "bdi" => Some("BDI"),
         "hu" | "hun" | "hundredgige" => Some("Hu"),
         "tf" | "twentyfivegige" => Some("TF"),
         "fo" | "fortygige" => Some("Fo"),
@@ -1574,6 +1590,345 @@ pub fn build_delete_subinterface_with_l2vpn_script(
     }
     command_list.push("end".to_string());
     Ok(command_list)
+}
+
+/// Parses `show running-config | section ^interface` (or `show running-config interface ...`)
+/// from a Cisco IOS-XE / ASR 900 router into a list of `ServiceInstanceEntry` items.
+pub fn parse_ios_xe_service_instances(raw_output: &str) -> Vec<ServiceInstanceEntry> {
+    let sanitized_text = sanitize_pty_output(raw_output);
+    let mut instances: Vec<ServiceInstanceEntry> = Vec::new();
+    let mut current_interface = String::new();
+    let mut active_instance: Option<ServiceInstanceEntry> = None;
+
+    for raw_line in sanitized_text.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with("Building configuration")
+            || trimmed.starts_with("Current configuration")
+            || trimmed.starts_with("show ")
+        {
+            continue;
+        }
+
+        if let Some(after_interface) = trimmed.strip_prefix("interface ") {
+            if let Some(finished) = active_instance.take() {
+                instances.push(finished);
+            }
+            current_interface = after_interface
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            continue;
+        }
+
+        if trimmed == "!" || trimmed == "end" {
+            if let Some(finished) = active_instance.take() {
+                instances.push(finished);
+            }
+            continue;
+        }
+
+        if let Some(after_service) = trimmed.strip_prefix("service instance ") {
+            if current_interface.is_empty() {
+                continue;
+            }
+            if let Some(finished) = active_instance.take() {
+                instances.push(finished);
+            }
+            let instance_id = after_service
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if !instance_id.is_empty() {
+                active_instance = Some(ServiceInstanceEntry {
+                    parent_interface: current_interface.clone(),
+                    service_instance_id: instance_id,
+                    ..Default::default()
+                });
+            }
+            continue;
+        }
+
+        if let Some(ref mut instance) = active_instance {
+            if let Some(description_text) = trimmed.strip_prefix("description ") {
+                instance.description = description_text.trim().to_string();
+            } else if let Some(encapsulation_rest) = trimmed.strip_prefix("encapsulation dot1q ") {
+                if let Some((outer_vlan, inner_vlan)) =
+                    encapsulation_rest.split_once("second-dot1q")
+                {
+                    instance.vlan_id = outer_vlan.trim().to_string();
+                    instance.second_vlan_id = inner_vlan
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                } else {
+                    instance.vlan_id = encapsulation_rest
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                }
+            } else if let Some(encapsulation_other) = trimmed.strip_prefix("encapsulation ") {
+                if instance.vlan_id.is_empty() {
+                    instance.vlan_id = encapsulation_other.trim().to_string();
+                }
+            } else if trimmed.starts_with("rewrite ingress ") {
+                if trimmed.contains("pop 2") {
+                    instance.rewrite_ingress_pop = 2;
+                } else {
+                    instance.rewrite_ingress_pop = 1;
+                }
+            } else if let Some(xconnect_rest) = trimmed.strip_prefix("xconnect ") {
+                let mut tokens = xconnect_rest.split_whitespace();
+                if let (Some(peer_ip), Some(pw_id)) = (tokens.next(), tokens.next()) {
+                    instance.binding_type = ServiceInstanceBinding::Xconnect;
+                    instance.xconnect_peer_ip = peer_ip.to_string();
+                    instance.xconnect_pw_id = pw_id.to_string();
+                }
+            } else if let Some(bd_rest) = trimmed.strip_prefix("bridge-domain ") {
+                let mut tokens = bd_rest.split_whitespace();
+                if let Some(bd_id) = tokens.next() {
+                    instance.binding_type = ServiceInstanceBinding::BridgeDomain;
+                    instance.bridge_domain_id = bd_id.to_string();
+                    instance.split_horizon = bd_rest.contains("split-horizon");
+                }
+            }
+        }
+    }
+
+    if let Some(finished) = active_instance.take() {
+        instances.push(finished);
+    }
+
+    instances
+}
+
+/// Returns all IOS-XE service instances belonging to `interface_name`.
+pub fn find_service_instances_for_interface<'a>(
+    interface_name: &str,
+    instances: &'a [ServiceInstanceEntry],
+) -> Vec<&'a ServiceInstanceEntry> {
+    instances
+        .iter()
+        .filter(|entry| same_cisco_interface(interface_name, &entry.parent_interface))
+        .collect()
+}
+
+/// Formats a compact summary badge for the main Interface Table's 4th column in IOS-XE / ASR 900 mode.
+pub fn format_service_instance_summary(
+    interface_name: &str,
+    instances: &[ServiceInstanceEntry],
+) -> Option<String> {
+    let matching = find_service_instances_for_interface(interface_name, instances);
+    if matching.is_empty() {
+        return None;
+    }
+    if matching.len() == 1 {
+        let first = matching[0];
+        let binding_summary = match first.binding_type {
+            ServiceInstanceBinding::Xconnect => {
+                format!("XC {}:{}", first.xconnect_peer_ip, first.xconnect_pw_id)
+            }
+            ServiceInstanceBinding::BridgeDomain => {
+                format!("BD {}", first.bridge_domain_id)
+            }
+            ServiceInstanceBinding::None => format!("VLAN {}", first.vlan_id),
+        };
+        Some(format!("SI {}: {}", first.service_instance_id, binding_summary))
+    } else {
+        let ids: Vec<&str> = matching
+            .iter()
+            .take(3)
+            .map(|entry| entry.service_instance_id.as_str())
+            .collect();
+        let suffix = if matching.len() > 3 { ", ..." } else { "" };
+        Some(format!("{} SIs ({}{})", matching.len(), ids.join(", "), suffix))
+    }
+}
+
+/// Editable fields for creating or modifying a Cisco IOS-XE / ASR 900 `service instance <id> ethernet`.
+#[derive(Clone, Debug, Default)]
+pub struct ServiceInstanceEditorForm {
+    pub parent_interface: String,
+    pub service_instance_id: String,
+    pub description: String,
+    pub vlan_id: String,
+    pub second_vlan_id: String,
+    pub rewrite_ingress_pop: u8,
+    pub binding_type: ServiceInstanceBinding,
+    pub xconnect_peer_ip: String,
+    pub xconnect_pw_id: String,
+    pub bridge_domain_id: String,
+    pub split_horizon: bool,
+    pub original_instance: Option<ServiceInstanceEntry>,
+}
+
+/// Generates the Cisco IOS-XE CLI script for creating or updating a `service instance <id> ethernet`.
+pub fn build_service_instance_script(form: &ServiceInstanceEditorForm) -> Vec<String> {
+    let parent = expand_interface_name_for_os(&form.parent_interface, CiscoOs::Ios);
+    let instance_id = form.service_instance_id.trim();
+    if parent.is_empty() || instance_id.is_empty() {
+        return Vec::new();
+    }
+
+    let mut commands = vec![
+        "configure terminal".to_string(),
+        format!("interface {}", parent),
+        format!(" service instance {} ethernet", instance_id),
+    ];
+
+    let previous_matching = form.original_instance.as_ref().filter(|original| {
+        same_cisco_interface(&original.parent_interface, &parent)
+            && original.service_instance_id == instance_id
+    });
+
+    if let Some(previous) = previous_matching {
+        // Delta-only mode for existing service instance
+        let old_description = previous.description.trim();
+        let new_description = form.description.trim();
+        if old_description != new_description {
+            if !old_description.is_empty() && new_description.is_empty() {
+                commands.push("  no description".to_string());
+            } else if !new_description.is_empty() {
+                commands.push(format!("  description {}", new_description));
+            }
+        }
+
+        let old_encapsulation =
+            format_dot1q_encapsulation_clause(&previous.vlan_id, &previous.second_vlan_id);
+        let new_encapsulation =
+            format_dot1q_encapsulation_clause(&form.vlan_id, &form.second_vlan_id);
+        if old_encapsulation != new_encapsulation {
+            if !old_encapsulation.is_empty() {
+                commands.push(format!("  no {}", old_encapsulation));
+            }
+            if !new_encapsulation.is_empty() {
+                commands.push(format!("  {}", new_encapsulation));
+            }
+        }
+
+        if previous.rewrite_ingress_pop != form.rewrite_ingress_pop {
+            if previous.rewrite_ingress_pop > 0 {
+                commands.push(format!(
+                    "  no rewrite ingress tag pop {} symmetric",
+                    previous.rewrite_ingress_pop
+                ));
+            }
+            if form.rewrite_ingress_pop > 0 {
+                commands.push(format!(
+                    "  rewrite ingress tag pop {} symmetric",
+                    form.rewrite_ingress_pop
+                ));
+            }
+        }
+
+        let old_binding = format_service_instance_binding_clause(
+            previous.binding_type,
+            &previous.xconnect_peer_ip,
+            &previous.xconnect_pw_id,
+            &previous.bridge_domain_id,
+            previous.split_horizon,
+        );
+        let new_binding = format_service_instance_binding_clause(
+            form.binding_type,
+            &form.xconnect_peer_ip,
+            &form.xconnect_pw_id,
+            &form.bridge_domain_id,
+            form.split_horizon,
+        );
+        if old_binding != new_binding {
+            if let Some(old_clause) = old_binding {
+                commands.push(format!("  no {}", old_clause));
+            }
+            if let Some(new_clause) = new_binding {
+                commands.push(format!("  {}", new_clause));
+            }
+        }
+    } else {
+        // New service instance
+        let trimmed_description = form.description.trim();
+        if !trimmed_description.is_empty() {
+            commands.push(format!("  description {}", trimmed_description));
+        }
+        let encapsulation =
+            format_dot1q_encapsulation_clause(&form.vlan_id, &form.second_vlan_id);
+        if !encapsulation.is_empty() {
+            commands.push(format!("  {}", encapsulation));
+        }
+        if form.rewrite_ingress_pop > 0 {
+            commands.push(format!(
+                "  rewrite ingress tag pop {} symmetric",
+                form.rewrite_ingress_pop
+            ));
+        }
+        if let Some(binding_clause) = format_service_instance_binding_clause(
+            form.binding_type,
+            &form.xconnect_peer_ip,
+            &form.xconnect_pw_id,
+            &form.bridge_domain_id,
+            form.split_horizon,
+        ) {
+            commands.push(format!("  {}", binding_clause));
+        }
+    }
+
+    commands.push("end".to_string());
+    commands
+}
+
+fn format_service_instance_binding_clause(
+    binding_type: ServiceInstanceBinding,
+    peer_ip: &str,
+    pw_id: &str,
+    bridge_domain_id: &str,
+    split_horizon: bool,
+) -> Option<String> {
+    match binding_type {
+        ServiceInstanceBinding::None => None,
+        ServiceInstanceBinding::Xconnect => {
+            let trimmed_ip = peer_ip.trim();
+            let trimmed_pw = pw_id.trim();
+            if trimmed_ip.is_empty() || trimmed_pw.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "xconnect {} {} encapsulation mpls",
+                    trimmed_ip, trimmed_pw
+                ))
+            }
+        }
+        ServiceInstanceBinding::BridgeDomain => {
+            let trimmed_bd = bridge_domain_id.trim();
+            if trimmed_bd.is_empty() {
+                None
+            } else if split_horizon {
+                Some(format!("bridge-domain {} split-horizon", trimmed_bd))
+            } else {
+                Some(format!("bridge-domain {}", trimmed_bd))
+            }
+        }
+    }
+}
+
+/// Builds a CLI script to delete a single `service instance <id> ethernet` under `interface <parent>`.
+pub fn build_delete_service_instance_script(
+    parent_interface: &str,
+    service_instance_id: &str,
+) -> Vec<String> {
+    let parent = expand_interface_name_for_os(parent_interface, CiscoOs::Ios);
+    vec![
+        "configure terminal".to_string(),
+        format!("interface {}", parent),
+        format!(" no service instance {} ethernet", service_instance_id.trim()),
+        "end".to_string(),
+    ]
 }
 
 /// Builds a CLI script to delete an entire L2VPN `p2p` xconnect or `bridge-domain` stanza.
@@ -2196,5 +2551,96 @@ interface TenGigE0/1/0/1.10002000 l2transport
         assert!(delete_script.contains(&" bridge group ENTERPRISE_SERVICES".to_string()));
         assert!(delete_script.contains(&"  bridge-domain CORP_VOICE".to_string()));
         assert!(delete_script.contains(&"   no interface Bundle-Ether10.200".to_string()));
+    }
+
+    #[test]
+    fn test_parse_and_build_ios_xe_service_instances() {
+        let sample_asr900_config = r#"Building configuration...
+
+Current configuration : 412 bytes
+!
+interface TenGigabitEthernet0/0/0
+ description Trunk Uplink
+ mtu 9100
+ no ip address
+ service instance 100 ethernet
+  description Customer Site A
+  encapsulation dot1q 100
+  rewrite ingress tag pop 1 symmetric
+  xconnect 192.0.2.10 100 encapsulation mpls
+ !
+ service instance 200 ethernet
+  description Customer ELAN
+  encapsulation dot1q 200 second-dot1q 300
+  rewrite ingress tag pop 2 symmetric
+  bridge-domain 200 split-horizon
+ !
+end"#;
+        let instances = parse_ios_xe_service_instances(sample_asr900_config);
+        assert_eq!(instances.len(), 2);
+
+        assert_eq!(instances[0].parent_interface, "TenGigabitEthernet0/0/0");
+        assert_eq!(instances[0].service_instance_id, "100");
+        assert_eq!(instances[0].description, "Customer Site A");
+        assert_eq!(instances[0].vlan_id, "100");
+        assert_eq!(instances[0].rewrite_ingress_pop, 1);
+        assert_eq!(instances[0].binding_type, ServiceInstanceBinding::Xconnect);
+        assert_eq!(instances[0].xconnect_peer_ip, "192.0.2.10");
+        assert_eq!(instances[0].xconnect_pw_id, "100");
+
+        assert_eq!(instances[1].service_instance_id, "200");
+        assert_eq!(instances[1].vlan_id, "200");
+        assert_eq!(instances[1].second_vlan_id, "300");
+        assert_eq!(instances[1].rewrite_ingress_pop, 2);
+        assert_eq!(
+            instances[1].binding_type,
+            ServiceInstanceBinding::BridgeDomain
+        );
+        assert_eq!(instances[1].bridge_domain_id, "200");
+        assert!(instances[1].split_horizon);
+
+        assert_eq!(
+            format_service_instance_summary("Te0/0/0", &instances),
+            Some("2 SIs (100, 200)".to_string())
+        );
+
+        // Delta-only edit on existing service instance 100: change peer IP and pop count
+        let modified_form = ServiceInstanceEditorForm {
+            parent_interface: "Te0/0/0".to_string(),
+            service_instance_id: "100".to_string(),
+            description: "Customer Site A".to_string(),
+            vlan_id: "100".to_string(),
+            second_vlan_id: String::new(),
+            rewrite_ingress_pop: 1,
+            binding_type: ServiceInstanceBinding::Xconnect,
+            xconnect_peer_ip: "192.0.2.20".to_string(),
+            xconnect_pw_id: "100".to_string(),
+            bridge_domain_id: String::new(),
+            split_horizon: false,
+            original_instance: Some(instances[0].clone()),
+        };
+        let delta_script = build_service_instance_script(&modified_form);
+        assert_eq!(
+            delta_script,
+            vec![
+                "configure terminal",
+                "interface TenGigabitEthernet0/0/0",
+                " service instance 100 ethernet",
+                "  no xconnect 192.0.2.10 100 encapsulation mpls",
+                "  xconnect 192.0.2.20 100 encapsulation mpls",
+                "end",
+            ]
+        );
+
+        let delete_script = build_delete_service_instance_script("Te0/0/0", "100");
+        assert_eq!(
+            delete_script,
+            vec![
+                "configure terminal",
+                "interface TenGigabitEthernet0/0/0",
+                " no service instance 100 ethernet",
+                "end",
+            ]
+        );
     }
 }

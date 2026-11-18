@@ -1,14 +1,16 @@
 use crate::cisco::{
-    build_delete_l2vpn_service_script, build_delete_subinterface_with_l2vpn_script,
-    build_l2vpn_service_script, build_no_shutdown_script, build_shutdown_script,
-    build_unified_interface_script, expand_full_interface_name,
-    extract_vlans_from_subinterface_name, find_l2vpn_for_interface, format_l2vpn_neighbors,
+    build_delete_l2vpn_service_script, build_delete_service_instance_script,
+    build_delete_subinterface_with_l2vpn_script, build_l2vpn_service_script,
+    build_no_shutdown_script, build_service_instance_script, build_shutdown_script,
+    build_unified_interface_script, expand_full_interface_name, expand_interface_name_for_os,
+    extract_vlans_from_subinterface_name, find_l2vpn_for_interface,
+    find_service_instances_for_interface, format_l2vpn_neighbors, format_service_instance_summary,
     has_ios_xr_interface_naming, is_deletable_subinterface, parse_interface_running_config,
-    same_cisco_interface, InterfaceEditorForm, L2vpnEditorForm,
+    same_cisco_interface, InterfaceEditorForm, L2vpnEditorForm, ServiceInstanceEditorForm,
 };
 use crate::model::{
     ActionLog, CiscoOs, ConnectionConfig, InterfaceEntry, L2vpnServiceEntry, L2vpnServiceType,
-    LogLevel, SortField, SshRequest, SshResponse,
+    LogLevel, ServiceInstanceBinding, ServiceInstanceEntry, SortField, SshRequest, SshResponse,
 };
 use ratatui::widgets::TableState;
 use std::collections::HashMap;
@@ -21,12 +23,16 @@ pub enum CurrentView {
     InterfaceList,
     /// Table of L2VPN xconnect and bridge-domain services.
     L2vpnList,
+    /// Table of IOS-XE / ASR 900 Ethernet service instances.
+    ServiceInstanceList,
     /// Read-only popup showing a running-config (or a failed push's error report).
     ViewConfig,
     /// Popup form for editing or creating an interface.
     EditInterface,
     /// Popup form for editing or creating an L2VPN service.
     EditL2vpn,
+    /// Popup form for editing or creating an IOS-XE / ASR 900 service instance.
+    EditServiceInstance,
     /// "Are you sure?" popup listing the exact commands about to be sent.
     ConfirmAction,
     /// Login popup (host, username, password, port).
@@ -90,13 +96,21 @@ pub struct App {
     pub editor_form: InterfaceEditorForm,
     pub editor_active_field: usize,
 
-    // L2VPN (Xconnect & Bridge-Domain) Table & Editor state
+    // L2VPN (Xconnect & Bridge-Domain) Table & Editor state (IOS-XR)
     pub l2vpn_services: Vec<L2vpnServiceEntry>,
     pub l2vpn_table_state: TableState,
     pub l2vpn_filter_query: String,
     pub l2vpn_is_filtering: bool,
     pub l2vpn_form: L2vpnEditorForm,
     pub l2vpn_active_field: usize,
+
+    // Ethernet Service Instance (EVC) Table & Editor state (IOS-XE / ASR 900)
+    pub service_instances: Vec<ServiceInstanceEntry>,
+    pub service_instance_table_state: TableState,
+    pub service_instance_filter_query: String,
+    pub service_instance_is_filtering: bool,
+    pub service_instance_form: ServiceInstanceEditorForm,
+    pub service_instance_active_field: usize,
 
     // Confirmation modal state
     pub confirm_title: String,
@@ -199,6 +213,13 @@ impl App {
             l2vpn_form: L2vpnEditorForm::default(),
             l2vpn_active_field: 0,
 
+            service_instances: Vec::new(),
+            service_instance_table_state: TableState::default(),
+            service_instance_filter_query: String::new(),
+            service_instance_is_filtering: false,
+            service_instance_form: ServiceInstanceEditorForm::default(),
+            service_instance_active_field: 0,
+
             confirm_title: String::new(),
             confirm_commands: Vec::new(),
             confirm_action_description: String::new(),
@@ -233,14 +254,20 @@ impl App {
                 if lowercase_query.is_empty() {
                     true
                 } else {
-                    let l2vpn_match = find_l2vpn_for_interface(&entry.name, &self.l2vpn_services)
-                        .map(|(_, label)| label.to_lowercase().contains(&lowercase_query))
-                        .unwrap_or(false);
+                    let service_match = if self.connected_os == CiscoOs::Ios {
+                        format_service_instance_summary(&entry.name, &self.service_instances)
+                            .map(|label| label.to_lowercase().contains(&lowercase_query))
+                            .unwrap_or(false)
+                    } else {
+                        find_l2vpn_for_interface(&entry.name, &self.l2vpn_services)
+                            .map(|(_, label)| label.to_lowercase().contains(&lowercase_query))
+                            .unwrap_or(false)
+                    };
                     entry.name.to_lowercase().contains(&lowercase_query)
                         || entry.description.to_lowercase().contains(&lowercase_query)
                         || entry.status.to_lowercase().contains(&lowercase_query)
                         || entry.protocol.to_lowercase().contains(&lowercase_query)
-                        || l2vpn_match
+                        || service_match
                 }
             })
             .collect();
@@ -432,12 +459,15 @@ impl App {
         self.connected_host = "Not Connected".to_string();
         self.interfaces.clear();
         self.l2vpn_services.clear();
+        self.service_instances.clear();
         self.config_cache.clear();
         self.selected_interface_name = None;
         self.filter_query.clear();
         self.is_filtering = false;
         self.l2vpn_filter_query.clear();
         self.l2vpn_is_filtering = false;
+        self.service_instance_filter_query.clear();
+        self.service_instance_is_filtering = false;
         self.current_view = CurrentView::ConnectionModal;
         self.connection_active_field = 0;
         self.status_message = format!(
@@ -1127,6 +1157,273 @@ impl App {
         self.current_view = CurrentView::ConfirmAction;
     }
 
+    /// Returns all IOS-XE / ASR 900 service instances matching `service_instance_filter_query`.
+    pub fn filtered_service_instances(&self) -> Vec<&ServiceInstanceEntry> {
+        let lowercase_query = self.service_instance_filter_query.to_lowercase();
+        self.service_instances
+            .iter()
+            .filter(|instance| {
+                if lowercase_query.is_empty() {
+                    true
+                } else {
+                    instance
+                        .parent_interface
+                        .to_lowercase()
+                        .contains(&lowercase_query)
+                        || instance
+                            .service_instance_id
+                            .to_lowercase()
+                            .contains(&lowercase_query)
+                        || instance
+                            .description
+                            .to_lowercase()
+                            .contains(&lowercase_query)
+                        || instance.vlan_id.to_lowercase().contains(&lowercase_query)
+                        || instance
+                            .xconnect_peer_ip
+                            .to_lowercase()
+                            .contains(&lowercase_query)
+                        || instance
+                            .xconnect_pw_id
+                            .to_lowercase()
+                            .contains(&lowercase_query)
+                        || instance
+                            .bridge_domain_id
+                            .to_lowercase()
+                            .contains(&lowercase_query)
+                }
+            })
+            .collect()
+    }
+
+    /// Returns the currently highlighted service instance in `CurrentView::ServiceInstanceList`.
+    pub fn selected_service_instance(&self) -> Option<&ServiceInstanceEntry> {
+        let visible = self.filtered_service_instances();
+        if visible.is_empty() {
+            None
+        } else {
+            let selected_index = self
+                .service_instance_table_state
+                .selected()
+                .unwrap_or(0)
+                .min(visible.len() - 1);
+            Some(visible[selected_index])
+        }
+    }
+
+    pub fn service_instance_next_row(&mut self) {
+        let visible_count = self.filtered_service_instances().len();
+        if visible_count == 0 {
+            self.service_instance_table_state.select(None);
+            return;
+        }
+        let current = self.service_instance_table_state.selected().unwrap_or(0);
+        self.service_instance_table_state
+            .select(Some((current + 1).min(visible_count - 1)));
+    }
+
+    pub fn service_instance_previous_row(&mut self) {
+        let visible_count = self.filtered_service_instances().len();
+        if visible_count == 0 {
+            self.service_instance_table_state.select(None);
+            return;
+        }
+        let current = self.service_instance_table_state.selected().unwrap_or(0);
+        self.service_instance_table_state
+            .select(Some(current.saturating_sub(1)));
+    }
+
+    pub fn service_instance_page_down(&mut self, page_size: usize) {
+        let visible_count = self.filtered_service_instances().len();
+        if visible_count == 0 {
+            return;
+        }
+        let current = self.service_instance_table_state.selected().unwrap_or(0);
+        self.service_instance_table_state
+            .select(Some((current + page_size).min(visible_count - 1)));
+    }
+
+    pub fn service_instance_page_up(&mut self, page_size: usize) {
+        let visible_count = self.filtered_service_instances().len();
+        if visible_count == 0 {
+            return;
+        }
+        let current = self.service_instance_table_state.selected().unwrap_or(0);
+        self.service_instance_table_state
+            .select(Some(current.saturating_sub(page_size)));
+    }
+
+    pub fn populate_service_instance_form(&mut self, instance: &ServiceInstanceEntry) {
+        self.service_instance_form = ServiceInstanceEditorForm {
+            parent_interface: instance.parent_interface.clone(),
+            service_instance_id: instance.service_instance_id.clone(),
+            description: instance.description.clone(),
+            vlan_id: instance.vlan_id.clone(),
+            second_vlan_id: instance.second_vlan_id.clone(),
+            rewrite_ingress_pop: instance.rewrite_ingress_pop,
+            binding_type: instance.binding_type,
+            xconnect_peer_ip: instance.xconnect_peer_ip.clone(),
+            xconnect_pw_id: instance.xconnect_pw_id.clone(),
+            bridge_domain_id: instance.bridge_domain_id.clone(),
+            split_horizon: instance.split_horizon,
+            original_instance: Some(instance.clone()),
+        };
+    }
+
+    /// Opens the ASR 900 Service Instance Editor for the selected port in `InterfaceList`
+    /// (pre-filling an existing service instance on that port if one exists, or starting a new one).
+    pub fn initiate_edit_service_instance_for_selected_interface(&mut self, from_port_editor: bool) {
+        let target_port_name = if from_port_editor {
+            self.editor_form.interface.trim().to_string()
+        } else {
+            match self.selected_interface() {
+                Some(entry) => entry.name.clone(),
+                None => return,
+            }
+        };
+        if target_port_name.is_empty() {
+            return;
+        }
+
+        let existing = find_service_instances_for_interface(&target_port_name, &self.service_instances);
+        if let Some(first_instance) = existing.first() {
+            let cloned = (*first_instance).clone();
+            self.populate_service_instance_form(&cloned);
+            self.service_instance_active_field = 1;
+        } else {
+            self.service_instance_form = ServiceInstanceEditorForm {
+                parent_interface: expand_interface_name_for_os(&target_port_name, CiscoOs::Ios),
+                service_instance_id: String::new(),
+                description: String::new(),
+                vlan_id: String::new(),
+                second_vlan_id: String::new(),
+                rewrite_ingress_pop: 1,
+                binding_type: ServiceInstanceBinding::Xconnect,
+                xconnect_peer_ip: String::new(),
+                xconnect_pw_id: String::new(),
+                bridge_domain_id: String::new(),
+                split_horizon: false,
+                original_instance: None,
+            };
+            self.service_instance_active_field = 1;
+        }
+
+        self.previous_view = self.current_view;
+        self.current_view = CurrentView::EditServiceInstance;
+    }
+
+    /// Opens the Service Instance Editor for the highlighted row in `CurrentView::ServiceInstanceList`.
+    pub fn initiate_edit_selected_service_instance(&mut self) {
+        let Some(selected) = self.selected_service_instance().cloned() else {
+            return;
+        };
+        self.populate_service_instance_form(&selected);
+        self.service_instance_active_field = 2;
+        self.previous_view = CurrentView::ServiceInstanceList;
+        self.current_view = CurrentView::EditServiceInstance;
+    }
+
+    /// Opens the Service Instance Editor to create a brand-new `service instance <id> ethernet`.
+    pub fn initiate_add_service_instance(&mut self) {
+        let default_parent = self
+            .selected_service_instance()
+            .map(|entry| entry.parent_interface.clone())
+            .or_else(|| {
+                self.interfaces
+                    .iter()
+                    .find(|entry| !entry.name.starts_with("Loopback") && !entry.name.starts_with("BDI"))
+                    .map(|entry| expand_interface_name_for_os(&entry.name, CiscoOs::Ios))
+            })
+            .unwrap_or_else(|| "TenGigabitEthernet0/0/0".to_string());
+
+        self.service_instance_form = ServiceInstanceEditorForm {
+            parent_interface: default_parent,
+            service_instance_id: String::new(),
+            description: String::new(),
+            vlan_id: String::new(),
+            second_vlan_id: String::new(),
+            rewrite_ingress_pop: 1,
+            binding_type: ServiceInstanceBinding::Xconnect,
+            xconnect_peer_ip: String::new(),
+            xconnect_pw_id: String::new(),
+            bridge_domain_id: String::new(),
+            split_horizon: false,
+            original_instance: None,
+        };
+        self.service_instance_active_field = 1;
+        self.previous_view = self.current_view;
+        self.current_view = CurrentView::EditServiceInstance;
+    }
+
+    /// Cycles Field 0 (`Parent Interface`) through candidate interfaces on the router.
+    pub fn cycle_service_instance_parent_interface(&mut self) {
+        let candidate_interfaces: Vec<String> = self
+            .interfaces
+            .iter()
+            .filter(|entry| {
+                !entry.name.starts_with("Loopback")
+                    && !entry.name.starts_with("Null")
+                    && !entry.name.starts_with("BDI")
+                    && !entry.name.contains('.')
+            })
+            .map(|entry| expand_interface_name_for_os(&entry.name, CiscoOs::Ios))
+            .collect();
+        if candidate_interfaces.is_empty() {
+            return;
+        }
+        let current_index = candidate_interfaces
+            .iter()
+            .position(|name| same_cisco_interface(name, &self.service_instance_form.parent_interface));
+        let next_index = match current_index {
+            Some(index) => (index + 1) % candidate_interfaces.len(),
+            None => 0,
+        };
+        self.service_instance_form.parent_interface = candidate_interfaces[next_index].clone();
+    }
+
+    /// Validates and opens the confirmation modal for an ASR 900 service instance.
+    pub fn confirm_service_instance_form(&mut self) {
+        if self.service_instance_form.parent_interface.trim().is_empty()
+            || self.service_instance_form.service_instance_id.trim().is_empty()
+        {
+            self.status_message =
+                "Parent Interface and Service Instance ID are required.".to_string();
+            return;
+        }
+
+        let generated_commands = build_service_instance_script(&self.service_instance_form);
+        let label = format!(
+            "{} SI {}",
+            self.service_instance_form.parent_interface.trim(),
+            self.service_instance_form.service_instance_id.trim()
+        );
+        self.confirm_title = format!("CONFIGURE SERVICE INSTANCE - {}", label);
+        self.confirm_action_description = format!("Configure {}", label);
+        self.confirm_commands = generated_commands;
+        self.previous_view = CurrentView::EditServiceInstance;
+        self.current_view = CurrentView::ConfirmAction;
+    }
+
+    /// Prepares a confirmation modal to delete the selected `service instance <id> ethernet`.
+    pub fn initiate_delete_selected_service_instance(&mut self) {
+        let Some(selected) = self.selected_service_instance().cloned() else {
+            return;
+        };
+        let generated_commands = build_delete_service_instance_script(
+            &selected.parent_interface,
+            &selected.service_instance_id,
+        );
+        let label = format!(
+            "{} SI {}",
+            selected.parent_interface, selected.service_instance_id
+        );
+        self.confirm_title = format!("DELETE SERVICE INSTANCE - {}", label);
+        self.confirm_action_description = format!("Delete {}", label);
+        self.confirm_commands = generated_commands;
+        self.previous_view = CurrentView::ServiceInstanceList;
+        self.current_view = CurrentView::ConfirmAction;
+    }
+
     /// Transitions from the Unified Port Editor to the Confirmation modal.
     pub fn confirm_editor_form(&mut self) {
         let generated_commands =
@@ -1339,6 +1636,28 @@ impl App {
                     format!("L2VPN poll error: {}", error_message),
                 );
             }
+            SshResponse::ServiceInstances(Ok(polled_instances)) => {
+                let instance_count = polled_instances.len();
+                self.service_instances = polled_instances;
+                let visible_count = self.filtered_service_instances().len();
+                if visible_count == 0 {
+                    self.service_instance_table_state.select(None);
+                } else {
+                    let current = self.service_instance_table_state.selected().unwrap_or(0);
+                    self.service_instance_table_state
+                        .select(Some(current.min(visible_count - 1)));
+                }
+                self.add_log(
+                    LogLevel::Info,
+                    format!("Polled {} IOS-XE service instances from router", instance_count),
+                );
+            }
+            SshResponse::ServiceInstances(Err(error_message)) => {
+                self.add_log(
+                    LogLevel::Warning,
+                    format!("Service instance poll error: {}", error_message),
+                );
+            }
             SshResponse::ConfigResult {
                 interface_name,
                 result: Ok(running_config),
@@ -1482,6 +1801,7 @@ impl App {
                 self.connected_host = "Not Connected".to_string();
                 self.interfaces.clear();
                 self.l2vpn_services.clear();
+                self.service_instances.clear();
                 self.config_cache.clear();
                 self.selected_interface_name = None;
                 self.status_message = format!("Session ended: {}", error_message);

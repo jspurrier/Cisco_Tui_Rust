@@ -1,9 +1,10 @@
 use crate::app::{App, CurrentView};
 use crate::cisco::{
-    abbreviate_interface_name, build_l2vpn_service_script, build_unified_interface_script,
-    check_ipv4_warnings, find_l2vpn_for_interface, sanitize_pty_output,
+    abbreviate_interface_name, build_l2vpn_service_script, build_service_instance_script,
+    build_unified_interface_script, check_ipv4_warnings, find_l2vpn_for_interface,
+    format_service_instance_summary, sanitize_pty_output,
 };
-use crate::model::{L2vpnServiceType, LogLevel, SortField};
+use crate::model::{CiscoOs, L2vpnServiceType, LogLevel, ServiceInstanceBinding, SortField};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -36,8 +37,18 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 || (app.previous_view == CurrentView::EditL2vpn
                     && !app.l2vpn_form.return_to_port_editor)));
 
+    let show_service_instance_background = app.current_view == CurrentView::ServiceInstanceList
+        || (app.current_view == CurrentView::EditServiceInstance
+            && app.previous_view == CurrentView::ServiceInstanceList)
+        || (app.current_view == CurrentView::ConfirmAction
+            && (app.previous_view == CurrentView::ServiceInstanceList
+                || (app.previous_view == CurrentView::EditServiceInstance
+                    && app.connected_os == CiscoOs::Ios)));
+
     if show_l2vpn_background {
         render_l2vpn_table(frame, app, main_vertical_sections[1]);
+    } else if show_service_instance_background {
+        render_service_instance_table(frame, app, main_vertical_sections[1]);
     } else {
         render_interface_table(frame, app, main_vertical_sections[1]);
     }
@@ -46,10 +57,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     // Render the active modal overlay on top of the main table
     match app.current_view {
-        CurrentView::InterfaceList | CurrentView::L2vpnList => {}
+        CurrentView::InterfaceList
+        | CurrentView::L2vpnList
+        | CurrentView::ServiceInstanceList => {}
         CurrentView::ViewConfig => render_view_config_modal(frame, app),
         CurrentView::EditInterface => render_edit_interface_modal(frame, app),
         CurrentView::EditL2vpn => render_edit_l2vpn_modal(frame, app),
+        CurrentView::EditServiceInstance => render_edit_service_instance_modal(frame, app),
         CurrentView::ConfirmAction => render_confirm_action_modal(frame, app),
         CurrentView::ConnectionModal => render_connection_modal(frame, app),
         CurrentView::CommandRunner => render_command_runner_modal(frame, app),
@@ -172,6 +186,8 @@ fn render_interface_table(frame: &mut Frame, app: &mut App, content_area: Rect) 
 
     let visible_interfaces: Vec<_> = app.filtered_interfaces().into_iter().cloned().collect();
     let l2vpn_services = app.l2vpn_services.clone();
+    let service_instances = app.service_instances.clone();
+    let is_ios_xe = app.connected_os == CiscoOs::Ios;
     let total_interface_count = app.interfaces.len();
     let visible_interface_count = visible_interfaces.len();
 
@@ -183,22 +199,30 @@ fn render_interface_table(frame: &mut Frame, app: &mut App, content_area: Rect) 
     };
     let sort_direction_symbol = if app.sort_ascending { "▲" } else { "▼" };
 
+    let (services_label, services_count) = if is_ios_xe {
+        ("Service Instances", service_instances.len())
+    } else {
+        ("L2VPN Table", l2vpn_services.len())
+    };
+
     let table_block_title = if !app.filter_query.is_empty() {
         format!(
-            " Interfaces (Showing {} of {}, Sorted by {} {}) | Press [w] for L2VPN Table ({}) ",
+            " Interfaces (Showing {} of {}, Sorted by {} {}) | Press [w] for {} ({}) ",
             visible_interface_count,
             total_interface_count,
             sort_column_name,
             sort_direction_symbol,
-            l2vpn_services.len()
+            services_label,
+            services_count
         )
     } else {
         format!(
-            " Interfaces (Total {}, Sorted by {} {}) | Press [w] for L2VPN Table ({}) ",
+            " Interfaces (Total {}, Sorted by {} {}) | Press [w] for {} ({}) ",
             total_interface_count,
             sort_column_name,
             sort_direction_symbol,
-            l2vpn_services.len()
+            services_label,
+            services_count
         )
     };
 
@@ -228,18 +252,25 @@ fn render_interface_table(frame: &mut Frame, app: &mut App, content_area: Rect) 
                 Style::default().fg(Color::White)
             };
 
-            let (l2vpn_label, l2vpn_style) =
-                if let Some((service, label)) =
-                    find_l2vpn_for_interface(&interface_entry.name, &l2vpn_services)
+            let (l2vpn_label, l2vpn_style) = if is_ios_xe {
+                if let Some(summary) =
+                    format_service_instance_summary(&interface_entry.name, &service_instances)
                 {
-                    let color = match service.service_type {
-                        L2vpnServiceType::XconnectP2p => Color::Magenta,
-                        L2vpnServiceType::BridgeDomain => Color::Cyan,
-                    };
-                    (label, Style::default().fg(color))
+                    (summary, Style::default().fg(Color::Magenta))
                 } else {
                     (String::new(), Style::default().fg(Color::DarkGray))
+                }
+            } else if let Some((service, label)) =
+                find_l2vpn_for_interface(&interface_entry.name, &l2vpn_services)
+            {
+                let color = match service.service_type {
+                    L2vpnServiceType::XconnectP2p => Color::Magenta,
+                    L2vpnServiceType::BridgeDomain => Color::Cyan,
                 };
+                (label, Style::default().fg(color))
+            } else {
+                (String::new(), Style::default().fg(Color::DarkGray))
+            };
 
             Row::new(vec![
                 Cell::from(interface_entry.name.clone()).style(interface_name_style),
@@ -267,7 +298,11 @@ fn render_interface_table(frame: &mut Frame, app: &mut App, content_area: Rect) 
             "Interface",
             "Physical Status",
             "Line Protocol",
-            "L2VPN Binding",
+            if is_ios_xe {
+                "Service Instances (EVC)"
+            } else {
+                "L2VPN Binding"
+            },
             "Description",
         ])
         .style(
@@ -439,6 +474,157 @@ fn render_l2vpn_table(frame: &mut Frame, app: &mut App, content_area: Rect) {
     frame.render_stateful_widget(l2vpn_table_widget, table_area, &mut app.l2vpn_table_state);
 }
 
+/// Renders the dedicated IOS-XE / ASR 900 Ethernet Service Instances (`service instance <id> ethernet`) Table View (`w`).
+fn render_service_instance_table(frame: &mut Frame, app: &mut App, content_area: Rect) {
+    let table_area =
+        if app.service_instance_is_filtering || !app.service_instance_filter_query.is_empty() {
+            let filter_and_table_layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Min(5)])
+                .split(content_area);
+
+            let filter_prompt_text = if app.service_instance_is_filtering {
+                format!(
+                    " Search Service Instances: [ {}_ ]  (Enter: keep filter, Esc: clear)",
+                    app.service_instance_filter_query
+                )
+            } else {
+                format!(
+                    " Active Service Filter: '{}'  (Press '/' to edit, Esc to clear)",
+                    app.service_instance_filter_query
+                )
+            };
+
+            let filter_bar_widget = Paragraph::new(filter_prompt_text)
+                .style(Style::default().fg(Color::Yellow))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .title(" Service Instance Filter "),
+                );
+            frame.render_widget(filter_bar_widget, filter_and_table_layout[0]);
+
+            filter_and_table_layout[1]
+        } else {
+            content_area
+        };
+
+    let visible_instances: Vec<_> = app
+        .filtered_service_instances()
+        .into_iter()
+        .cloned()
+        .collect();
+    let total_count = app.service_instances.len();
+    let visible_count = visible_instances.len();
+
+    let table_title = format!(
+        " ASR 900 / IOS-XE Service Instances (Showing {} of {}) | Press [w/Esc] for Interfaces ",
+        visible_count, total_count
+    );
+
+    let rows: Vec<Row> = visible_instances
+        .iter()
+        .map(|instance| {
+            let vlan_summary = if !instance.second_vlan_id.is_empty() {
+                format!(
+                    "dot1q {}.{} (pop {})",
+                    instance.vlan_id, instance.second_vlan_id, instance.rewrite_ingress_pop
+                )
+            } else if !instance.vlan_id.is_empty() {
+                if instance.rewrite_ingress_pop > 0 {
+                    format!(
+                        "dot1q {} (pop {})",
+                        instance.vlan_id, instance.rewrite_ingress_pop
+                    )
+                } else {
+                    format!("dot1q {}", instance.vlan_id)
+                }
+            } else {
+                "(none)".to_string()
+            };
+
+            let (binding_summary, binding_color) = match instance.binding_type {
+                ServiceInstanceBinding::Xconnect => (
+                    format!(
+                        "xconnect {} {}",
+                        instance.xconnect_peer_ip, instance.xconnect_pw_id
+                    ),
+                    Color::Magenta,
+                ),
+                ServiceInstanceBinding::BridgeDomain => (
+                    if instance.split_horizon {
+                        format!("bridge-domain {} [SH]", instance.bridge_domain_id)
+                    } else {
+                        format!("bridge-domain {}", instance.bridge_domain_id)
+                    },
+                    Color::Cyan,
+                ),
+                ServiceInstanceBinding::None => ("(local / none)".to_string(), Color::DarkGray),
+            };
+
+            Row::new(vec![
+                Cell::from(abbreviate_interface_name(&instance.parent_interface))
+                    .style(Style::default().fg(Color::Yellow)),
+                Cell::from(instance.service_instance_id.clone()).style(
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Cell::from(vlan_summary).style(Style::default().fg(Color::Cyan)),
+                Cell::from(binding_summary).style(Style::default().fg(binding_color)),
+                Cell::from(instance.description.clone()).style(Style::default().fg(Color::Gray)),
+            ])
+        })
+        .collect();
+
+    let service_table_widget = Table::new(
+        rows,
+        [
+            Constraint::Percentage(16),
+            Constraint::Percentage(10),
+            Constraint::Percentage(22),
+            Constraint::Percentage(26),
+            Constraint::Percentage(26),
+        ],
+    )
+    .header(
+        Row::new(vec![
+            "Parent Port",
+            "SI ID",
+            "Encapsulation & Rewrite",
+            "Forwarding Binding",
+            "Description",
+        ])
+        .style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .bottom_margin(1),
+    )
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Magenta))
+            .title(table_title),
+    )
+    .highlight_style(
+        Style::default()
+            .bg(Color::Rgb(45, 30, 60))
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol(">> ");
+
+    frame.render_stateful_widget(
+        service_table_widget,
+        table_area,
+        &mut app.service_instance_table_state,
+    );
+}
+
 /// Draws the bottom bar: the latest status message plus the shortcut keys for the current table.
 fn render_footer_bar(frame: &mut Frame, app: &App, footer_area: Rect) {
     let footer_line = if app.current_view == CurrentView::L2vpnList {
@@ -465,7 +651,32 @@ fn render_footer_bar(frame: &mut Frame, app: &App, footer_area: Rect) {
             Span::styled("[q]", Style::default().fg(Color::Yellow)),
             Span::raw(" Logout"),
         ])
+    } else if app.current_view == CurrentView::ServiceInstanceList {
+        Line::from(vec![
+            Span::styled(
+                format!(" {} ", app.status_message),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::raw(" | "),
+            Span::styled("[Enter/e]", Style::default().fg(Color::Yellow)),
+            Span::raw(" Edit SI "),
+            Span::styled("[n]", Style::default().fg(Color::Magenta)),
+            Span::raw(" New SI "),
+            Span::styled("[x/Del]", Style::default().fg(Color::LightRed)),
+            Span::raw(" Del SI "),
+            Span::styled("[/]", Style::default().fg(Color::Yellow)),
+            Span::raw(" Filter "),
+            Span::styled("[w/Esc]", Style::default().fg(Color::Cyan)),
+            Span::raw(" Interfaces "),
+            Span::styled("[r]", Style::default().fg(Color::Yellow)),
+            Span::raw(" Refresh "),
+            Span::styled("[?]", Style::default().fg(Color::Yellow)),
+            Span::raw(" Help "),
+            Span::styled("[q]", Style::default().fg(Color::Yellow)),
+            Span::raw(" Logout"),
+        ])
     } else {
+        let is_ios_xe = app.connected_os == CiscoOs::Ios;
         Line::from(vec![
             Span::styled(
                 format!(" {} ", app.status_message),
@@ -477,9 +688,9 @@ fn render_footer_bar(frame: &mut Frame, app: &App, footer_area: Rect) {
             Span::styled("[n]", Style::default().fg(Color::Magenta)),
             Span::raw(" Subport "),
             Span::styled("[b]", Style::default().fg(Color::Cyan)),
-            Span::raw(" Bind L2VPN "),
+            Span::raw(if is_ios_xe { " Add/Edit SI " } else { " Bind L2VPN " }),
             Span::styled("[w]", Style::default().fg(Color::Magenta)),
-            Span::raw(" L2VPN "),
+            Span::raw(if is_ios_xe { " Services " } else { " L2VPN " }),
             Span::styled("[x]", Style::default().fg(Color::LightRed)),
             Span::raw(" Del "),
             Span::styled("[v]", Style::default().fg(Color::Yellow)),
@@ -1555,6 +1766,387 @@ fn render_edit_l2vpn_modal(frame: &mut Frame, app: &App) {
     let footer_widget = Paragraph::new(footer_text)
         .alignment(Alignment::Center)
         .style(Style::default().fg(Color::Yellow));
+    frame.render_widget(footer_widget, modal_sections[2]);
+}
+
+/// Renders the Cisco IOS-XE / ASR 900 Ethernet Service Instance (`service instance <id> ethernet`) Editor Modal.
+///
+/// Field layout (9 fields, 0..=8):
+/// - Row 1: [0] Parent Port (Space: cycle)       | [1] Service Instance ID
+/// - Row 2: [2] Service Instance Description
+/// - Row 3: [3] Dot1Q VLAN | [4] 2nd VLAN (Opt) | [5] Rewrite Tag (Space)
+/// - Row 4: [6] Binding Mode (XC/BD/None)       | [7] Peer IP / BD ID | [8] PW VC-ID / Split-Horizon
+fn render_edit_service_instance_modal(frame: &mut Frame, app: &App) {
+    let modal_area = centered_exact_rect(94, 29, frame.size());
+    frame.render_widget(Clear, modal_area);
+
+    let modal_sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(12), // 4 rows of 3-line bordered input boxes
+            Constraint::Min(10),    // Live IOS-XE CLI preview box
+            Constraint::Length(2),  // Bottom navigation hints
+        ])
+        .margin(1)
+        .split(modal_area);
+
+    let outer_modal_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(Color::Magenta))
+        .title(format!(
+            " Configure ASR 900 / IOS-XE Service Instance ({}) ",
+            app.service_instance_form.parent_interface
+        ));
+    frame.render_widget(outer_modal_block, modal_area);
+
+    let form_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+        ])
+        .split(modal_sections[0]);
+
+    let focused_border_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let unfocused_border_style = Style::default().fg(Color::Gray);
+
+    // Row 1: [0] Parent Port & [1] Service Instance ID
+    let row_one_columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(form_rows[0]);
+
+    let parent_border = if app.service_instance_active_field == 0 {
+        focused_border_style
+    } else {
+        unfocused_border_style
+    };
+    let parent_cursor = if app.service_instance_active_field == 0 {
+        "_"
+    } else {
+        ""
+    };
+    let parent_widget = Paragraph::new(format!(
+        " {}{}",
+        app.service_instance_form.parent_interface, parent_cursor
+    ))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(parent_border)
+            .title(" [0] Parent Port (Space: Cycle Ports) "),
+    );
+    frame.render_widget(parent_widget, row_one_columns[0]);
+
+    let id_border = if app.service_instance_active_field == 1 {
+        focused_border_style
+    } else {
+        unfocused_border_style
+    };
+    let id_cursor = if app.service_instance_active_field == 1 {
+        "_"
+    } else {
+        ""
+    };
+    let id_widget = Paragraph::new(format!(
+        " {}{}",
+        app.service_instance_form.service_instance_id, id_cursor
+    ))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(id_border)
+            .title(" [1] Service Instance ID (e.g. 100) "),
+    );
+    frame.render_widget(id_widget, row_one_columns[1]);
+
+    // Row 2: [2] Description
+    let description_border = if app.service_instance_active_field == 2 {
+        focused_border_style
+    } else {
+        unfocused_border_style
+    };
+    let description_cursor = if app.service_instance_active_field == 2 {
+        "_"
+    } else {
+        ""
+    };
+    let description_widget = Paragraph::new(format!(
+        " {}{}",
+        app.service_instance_form.description, description_cursor
+    ))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(description_border)
+            .title(" [2] Service Instance Description "),
+    );
+    frame.render_widget(description_widget, form_rows[1]);
+
+    // Row 3: [3] Dot1Q VLAN, [4] 2nd Dot1Q VLAN, [5] Rewrite Ingress Tag
+    let row_three_columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(30),
+            Constraint::Percentage(30),
+            Constraint::Percentage(40),
+        ])
+        .split(form_rows[2]);
+
+    let vlan_border = if app.service_instance_active_field == 3 {
+        focused_border_style
+    } else {
+        unfocused_border_style
+    };
+    let vlan_cursor = if app.service_instance_active_field == 3 {
+        "_"
+    } else {
+        ""
+    };
+    let vlan_widget = Paragraph::new(format!(
+        " {}{}",
+        app.service_instance_form.vlan_id, vlan_cursor
+    ))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(vlan_border)
+            .title(" [3] Dot1Q VLAN "),
+    );
+    frame.render_widget(vlan_widget, row_three_columns[0]);
+
+    let second_vlan_border = if app.service_instance_active_field == 4 {
+        focused_border_style
+    } else {
+        unfocused_border_style
+    };
+    let second_vlan_cursor = if app.service_instance_active_field == 4 {
+        "_"
+    } else {
+        ""
+    };
+    let second_vlan_widget = Paragraph::new(format!(
+        " {}{}",
+        app.service_instance_form.second_vlan_id, second_vlan_cursor
+    ))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(second_vlan_border)
+            .title(" [4] 2nd VLAN (Opt) "),
+    );
+    frame.render_widget(second_vlan_widget, row_three_columns[1]);
+
+    let rewrite_border = if app.service_instance_active_field == 5 {
+        focused_border_style
+    } else {
+        unfocused_border_style
+    };
+    let active_tag_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let inactive_tag_style = Style::default().fg(Color::DarkGray);
+    let rewrite_line = match app.service_instance_form.rewrite_ingress_pop {
+        1 => Line::from(vec![
+            Span::styled(" (•)pop1", active_tag_style),
+            Span::styled(" ( )pop2", inactive_tag_style),
+            Span::styled(" ( )none", inactive_tag_style),
+        ]),
+        2 => Line::from(vec![
+            Span::styled(" ( )pop1", inactive_tag_style),
+            Span::styled(" (•)pop2", active_tag_style),
+            Span::styled(" ( )none", inactive_tag_style),
+        ]),
+        _ => Line::from(vec![
+            Span::styled(" ( )pop1", inactive_tag_style),
+            Span::styled(" ( )pop2", inactive_tag_style),
+            Span::styled(
+                " (•)none",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+    };
+    let rewrite_widget = Paragraph::new(rewrite_line).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(rewrite_border)
+            .title(" [5] Rewrite Tag (Space) "),
+    );
+    frame.render_widget(rewrite_widget, row_three_columns[2]);
+
+    // Row 4: [6] Binding Mode, [7] Peer IP / BD ID, [8] PW VC-ID / Split-Horizon
+    let row_four_columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(34),
+            Constraint::Percentage(32),
+        ])
+        .split(form_rows[3]);
+
+    let binding_border = if app.service_instance_active_field == 6 {
+        focused_border_style
+    } else {
+        unfocused_border_style
+    };
+    let binding_line = match app.service_instance_form.binding_type {
+        ServiceInstanceBinding::Xconnect => Line::from(vec![
+            Span::styled(
+                " (•) Xconnect",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ( ) BD", inactive_tag_style),
+            Span::styled(" ( ) None", inactive_tag_style),
+        ]),
+        ServiceInstanceBinding::BridgeDomain => Line::from(vec![
+            Span::styled(" ( ) XC ", inactive_tag_style),
+            Span::styled(
+                "(•) Bridge-Dom",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ( ) None", inactive_tag_style),
+        ]),
+        ServiceInstanceBinding::None => Line::from(vec![
+            Span::styled(" ( ) XC ", inactive_tag_style),
+            Span::styled("( ) BD ", inactive_tag_style),
+            Span::styled(
+                "(•) None",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+    };
+    let binding_widget = Paragraph::new(binding_line).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(binding_border)
+            .title(" [6] Binding Mode (Space) "),
+    );
+    frame.render_widget(binding_widget, row_four_columns[0]);
+
+    let target_border = if app.service_instance_active_field == 7 {
+        focused_border_style
+    } else {
+        unfocused_border_style
+    };
+    let target_cursor = if app.service_instance_active_field == 7 {
+        "_"
+    } else {
+        ""
+    };
+    let (target_title, target_value) = match app.service_instance_form.binding_type {
+        ServiceInstanceBinding::Xconnect => (
+            " [7] Xconnect Peer IP (e.g. 10.0.0.1) ",
+            format!("{}{}", app.service_instance_form.xconnect_peer_ip, target_cursor),
+        ),
+        ServiceInstanceBinding::BridgeDomain => (
+            " [7] Bridge-Domain ID (e.g. 10) ",
+            format!("{}{}", app.service_instance_form.bridge_domain_id, target_cursor),
+        ),
+        ServiceInstanceBinding::None => (
+            " [7] Peer IP / BD ID (Unused) ",
+            "(select XC or BD)".to_string(),
+        ),
+    };
+    let target_widget = Paragraph::new(format!(" {}", target_value)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(target_border)
+            .title(target_title),
+    );
+    frame.render_widget(target_widget, row_four_columns[1]);
+
+    let extra_border = if app.service_instance_active_field == 8 {
+        focused_border_style
+    } else {
+        unfocused_border_style
+    };
+    let extra_cursor = if app.service_instance_active_field == 8 {
+        "_"
+    } else {
+        ""
+    };
+    let (extra_title, extra_value) = match app.service_instance_form.binding_type {
+        ServiceInstanceBinding::Xconnect => (
+            " [8] PW VC-ID (e.g. 100) ",
+            format!(" {}{}", app.service_instance_form.xconnect_pw_id, extra_cursor),
+        ),
+        ServiceInstanceBinding::BridgeDomain => (
+            " [8] Split-Horizon (Space) ",
+            if app.service_instance_form.split_horizon {
+                " (•) split-horizon  ( ) Off".to_string()
+            } else {
+                " ( ) split-horizon  (•) Off".to_string()
+            },
+        ),
+        ServiceInstanceBinding::None => (
+            " [8] PW ID / Split-Horizon ",
+            " (unused)".to_string(),
+        ),
+    };
+    let extra_widget = Paragraph::new(extra_value).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(extra_border)
+            .title(extra_title),
+    );
+    frame.render_widget(extra_widget, row_four_columns[2]);
+
+    // Live CLI Script Preview
+    let preview_commands = build_service_instance_script(&app.service_instance_form);
+    let preview_lines: Vec<Line> = preview_commands
+        .iter()
+        .map(|command_line| {
+            let trimmed = command_line.trim();
+            let style = if command_line.starts_with("configure") || command_line.starts_with("interface ") {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if trimmed.starts_with("no ") {
+                Style::default()
+                    .fg(Color::LightRed)
+                    .add_modifier(Modifier::BOLD)
+            } else if trimmed.starts_with("service instance ") {
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD)
+            } else if trimmed.starts_with("xconnect ") || trimmed.starts_with("bridge-domain ") {
+                Style::default().fg(Color::Yellow)
+            } else if command_line == "end" {
+                Style::default().fg(Color::Blue)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            Line::from(Span::styled(format!("  {}", command_line), style))
+        })
+        .collect();
+
+    let preview_box = Paragraph::new(preview_lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(" Live IOS-XE Service Instance CLI Preview (Delta-Only Mode) "),
+    );
+    frame.render_widget(preview_box, modal_sections[1]);
+
+    let footer_widget = Paragraph::new(
+        "[Tab/Arrows]: Move  [Space]: Cycle/Toggle  [Enter]: Review & Push  [Esc]: Cancel",
+    )
+    .alignment(Alignment::Center)
+    .style(Style::default().fg(Color::Yellow));
     frame.render_widget(footer_widget, modal_sections[2]);
 }
 
