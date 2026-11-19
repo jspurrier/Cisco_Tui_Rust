@@ -9,11 +9,14 @@ use crate::cisco::{
     same_cisco_interface, InterfaceEditorForm, L2vpnEditorForm, ServiceInstanceEditorForm,
 };
 use crate::model::{
-    ActionLog, CiscoOs, ConnectionConfig, InterfaceEntry, L2vpnServiceEntry, L2vpnServiceType,
-    LogLevel, ServiceInstanceBinding, ServiceInstanceEntry, SortField, SshRequest, SshResponse,
+    ActionLog, CiscoOs, ConnectionConfig, HostKeyPromptDetails, InterfaceEntry, L2vpnServiceEntry,
+    L2vpnServiceType, LogLevel, ServiceInstanceBinding, ServiceInstanceEntry, SortField,
+    SshRequest, SshResponse,
 };
+use crate::ssh::HostKeyDecision;
 use ratatui::widgets::TableState;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Identifies which screen or popup modal currently has keyboard focus.
@@ -43,6 +46,8 @@ pub enum CurrentView {
     ActionLogs,
     /// Keyboard shortcut reference popup.
     Help,
+    /// Popup asking whether to trust a router's never-before-seen SSH host key.
+    HostKeyPrompt,
 }
 
 /// Central application state for the TUI.
@@ -134,6 +139,10 @@ pub struct App {
     // Channel sender to the background SSH worker task
     pub ssh_request_sender: mpsc::Sender<SshRequest>,
 
+    // Host key awaiting the operator's trust decision, and the slot the answer is written to
+    pub pending_host_key: Option<HostKeyPromptDetails>,
+    pub host_key_decision: Arc<HostKeyDecision>,
+
     // Flag indicating the user requested application exit
     pub should_quit: bool,
 }
@@ -144,6 +153,7 @@ impl App {
     /// fields are pre-filled with its values.
     pub fn new(
         ssh_request_sender: mpsc::Sender<SshRequest>,
+        host_key_decision: Arc<HostKeyDecision>,
         initial_connection_config: Option<ConnectionConfig>,
     ) -> Self {
         let mut initial_table_state = TableState::default();
@@ -239,6 +249,8 @@ impl App {
             logs_scroll: 0,
 
             ssh_request_sender,
+            pending_host_key: None,
+            host_key_decision,
             should_quit: false,
         }
     }
@@ -406,14 +418,12 @@ impl App {
     pub fn initiate_connect_from_modal(&mut self) {
         let trimmed_host = self.connection_host.trim().to_string();
         if trimmed_host.is_empty() {
-            self.status_message =
-                "Please enter a router IP, hostname, or 'demo'".to_string();
+            self.status_message = "Please enter a router IP, hostname, or 'demo'".to_string();
             self.connection_active_field = 0;
             return;
         }
 
-        let is_demo_session =
-            self.connection_use_mock || trimmed_host.eq_ignore_ascii_case("demo");
+        let is_demo_session = self.connection_use_mock || trimmed_host.eq_ignore_ascii_case("demo");
         if !is_demo_session && self.connection_username.trim().is_empty() {
             self.status_message = "Please enter your SSH username".to_string();
             self.connection_active_field = 1;
@@ -495,10 +505,7 @@ impl App {
             return;
         }
         self.is_loading = true;
-        self.status_message = format!(
-            "Refreshing interface table from {}...",
-            self.connected_host
-        );
+        self.status_message = format!("Refreshing interface table from {}...", self.connected_host);
         let sender = self.ssh_request_sender.clone();
         tokio::spawn(async move {
             let _ = sender.send(SshRequest::FetchInterfaces).await;
@@ -523,9 +530,7 @@ impl App {
 
             let sender = self.ssh_request_sender.clone();
             tokio::spawn(async move {
-                let _ = sender
-                    .send(SshRequest::GetConfig { interface_name })
-                    .await;
+                let _ = sender.send(SshRequest::GetConfig { interface_name }).await;
             });
         }
     }
@@ -540,68 +545,69 @@ impl App {
 
             let is_enabled_in_table = !interface_entry.status.to_lowercase().contains("admin");
 
-            let mut populated_form =
-                if let Some(cached_config) = self.config_cache.get(&interface_name) {
-                    let mut parsed_config = parse_interface_running_config(cached_config);
-                    if !parsed_config.has_explicit_shutdown_state {
-                        parsed_config.port_enabled = is_enabled_in_table;
-                    }
-                    let is_subinterface = interface_name.contains('.');
-                    InterfaceEditorForm {
-                        interface: interface_name.clone(),
-                        description: if !parsed_config.description.is_empty() {
-                            parsed_config.description.clone()
-                        } else {
-                            interface_entry.description.clone()
-                        },
-                        port_enabled: parsed_config.port_enabled,
-                        omit_port_state: is_subinterface && !parsed_config.has_explicit_shutdown_state,
-                        primary_ip: parsed_config.primary_ip.clone(),
-                        secondary_ip: parsed_config.secondary_ip.clone(),
-                        l2transport: parsed_config.l2transport,
-                        vlan_id: parsed_config.vlan_id.clone(),
-                        second_vlan_id: parsed_config.second_vlan_id.clone(),
-                        rewrite_ingress_pop: parsed_config.rewrite_ingress_pop,
-                        mtu: parsed_config.mtu.clone(),
-                        negotiation_auto: parsed_config.negotiation_auto,
-                        original_interface: interface_name.clone(),
-                        original_config: Some(parsed_config),
-                        pending_l2vpn: None,
-                    }
+            let mut populated_form = if let Some(cached_config) =
+                self.config_cache.get(&interface_name)
+            {
+                let mut parsed_config = parse_interface_running_config(cached_config);
+                if !parsed_config.has_explicit_shutdown_state {
+                    parsed_config.port_enabled = is_enabled_in_table;
+                }
+                let is_subinterface = interface_name.contains('.');
+                InterfaceEditorForm {
+                    interface: interface_name.clone(),
+                    description: if !parsed_config.description.is_empty() {
+                        parsed_config.description.clone()
+                    } else {
+                        interface_entry.description.clone()
+                    },
+                    port_enabled: parsed_config.port_enabled,
+                    omit_port_state: is_subinterface && !parsed_config.has_explicit_shutdown_state,
+                    primary_ip: parsed_config.primary_ip.clone(),
+                    secondary_ip: parsed_config.secondary_ip.clone(),
+                    l2transport: parsed_config.l2transport,
+                    vlan_id: parsed_config.vlan_id.clone(),
+                    second_vlan_id: parsed_config.second_vlan_id.clone(),
+                    rewrite_ingress_pop: parsed_config.rewrite_ingress_pop,
+                    mtu: parsed_config.mtu.clone(),
+                    negotiation_auto: parsed_config.negotiation_auto,
+                    original_interface: interface_name.clone(),
+                    original_config: Some(parsed_config),
+                    pending_l2vpn: None,
+                }
+            } else {
+                let is_subinterface = interface_name.contains('.');
+                let (extracted_outer_vlan, extracted_inner_vlan) = if is_subinterface {
+                    extract_vlans_from_subinterface_name(&interface_name)
                 } else {
-                    let is_subinterface = interface_name.contains('.');
-                    let (extracted_outer_vlan, extracted_inner_vlan) = if is_subinterface {
-                        extract_vlans_from_subinterface_name(&interface_name)
-                    } else {
-                        (String::new(), String::new())
-                    };
-                    let default_pop_count = if !extracted_inner_vlan.is_empty() {
-                        2
-                    } else if is_subinterface {
-                        1
-                    } else {
-                        0
-                    };
-
-                    // Request the full interface stanza in the background so IPs/VLANs/MTU populate automatically
-                    InterfaceEditorForm {
-                        interface: interface_name.clone(),
-                        description: interface_entry.description.clone(),
-                        port_enabled: is_enabled_in_table,
-                        omit_port_state: is_subinterface,
-                        primary_ip: String::new(),
-                        secondary_ip: String::new(),
-                        l2transport: is_subinterface,
-                        vlan_id: extracted_outer_vlan,
-                        second_vlan_id: extracted_inner_vlan,
-                        rewrite_ingress_pop: default_pop_count,
-                        mtu: String::new(),
-                        negotiation_auto: false,
-                        original_interface: interface_name.clone(),
-                        original_config: None,
-                        pending_l2vpn: None,
-                    }
+                    (String::new(), String::new())
                 };
+                let default_pop_count = if !extracted_inner_vlan.is_empty() {
+                    2
+                } else if is_subinterface {
+                    1
+                } else {
+                    0
+                };
+
+                // Request the full interface stanza in the background so IPs/VLANs/MTU populate automatically
+                InterfaceEditorForm {
+                    interface: interface_name.clone(),
+                    description: interface_entry.description.clone(),
+                    port_enabled: is_enabled_in_table,
+                    omit_port_state: is_subinterface,
+                    primary_ip: String::new(),
+                    secondary_ip: String::new(),
+                    l2transport: is_subinterface,
+                    vlan_id: extracted_outer_vlan,
+                    second_vlan_id: extracted_inner_vlan,
+                    rewrite_ingress_pop: default_pop_count,
+                    mtu: String::new(),
+                    negotiation_auto: false,
+                    original_interface: interface_name.clone(),
+                    original_config: None,
+                    pending_l2vpn: None,
+                }
+            };
 
             // Always request the latest running-config from the router so the editor reflects live state
             let sender = self.ssh_request_sender.clone();
@@ -714,8 +720,7 @@ impl App {
         ) {
             Ok(generated_commands) => {
                 self.confirm_title = format!("DELETE SUBINTERFACE - {}", interface_name);
-                self.confirm_action_description =
-                    format!("Delete subinterface {}", interface_name);
+                self.confirm_action_description = format!("Delete subinterface {}", interface_name);
                 self.confirm_commands = generated_commands;
                 self.previous_view = self.current_view;
                 self.current_view = CurrentView::ConfirmAction;
@@ -746,10 +751,7 @@ impl App {
                             .short_label()
                             .to_lowercase()
                             .contains(&lowercase_query)
-                        || service
-                            .routed_bvi
-                            .to_lowercase()
-                            .contains(&lowercase_query)
+                        || service.routed_bvi.to_lowercase().contains(&lowercase_query)
                         || service.interfaces.iter().any(|interface_attachment| {
                             interface_attachment
                                 .interface_name
@@ -757,10 +759,7 @@ impl App {
                                 .contains(&lowercase_query)
                         })
                         || service.neighbors.iter().any(|neighbor| {
-                            neighbor
-                                .peer_ipv4
-                                .to_lowercase()
-                                .contains(&lowercase_query)
+                            neighbor.peer_ipv4.to_lowercase().contains(&lowercase_query)
                                 || neighbor.pw_id.to_lowercase().contains(&lowercase_query)
                         })
                 }
@@ -848,10 +847,8 @@ impl App {
 
         let interface_action = if target_interface.is_empty() {
             0
-        } else if let Some(existing_attachment) = service
-            .interfaces
-            .iter()
-            .find(|interface_attachment| {
+        } else if let Some(existing_attachment) =
+            service.interfaces.iter().find(|interface_attachment| {
                 same_cisco_interface(&interface_attachment.interface_name, &target_interface)
             })
         {
@@ -1059,9 +1056,9 @@ impl App {
             return;
         }
 
-        let current_index = candidate_ports.iter().position(|(name, _)| {
-            same_cisco_interface(name, &self.l2vpn_form.target_interface)
-        });
+        let current_index = candidate_ports
+            .iter()
+            .position(|(name, _)| same_cisco_interface(name, &self.l2vpn_form.target_interface));
         let next_index = match current_index {
             Some(index) => (index + 1) % candidate_ports.len(),
             None => 0,
@@ -1272,7 +1269,10 @@ impl App {
 
     /// Opens the ASR 900 Service Instance Editor for the selected port in `InterfaceList`
     /// (pre-filling an existing service instance on that port if one exists, or starting a new one).
-    pub fn initiate_edit_service_instance_for_selected_interface(&mut self, from_port_editor: bool) {
+    pub fn initiate_edit_service_instance_for_selected_interface(
+        &mut self,
+        from_port_editor: bool,
+    ) {
         let target_port_name = if from_port_editor {
             self.editor_form.interface.trim().to_string()
         } else {
@@ -1285,7 +1285,8 @@ impl App {
             return;
         }
 
-        let existing = find_service_instances_for_interface(&target_port_name, &self.service_instances);
+        let existing =
+            find_service_instances_for_interface(&target_port_name, &self.service_instances);
         if let Some(first_instance) = existing.first() {
             let cloned = (*first_instance).clone();
             self.populate_service_instance_form(&cloned);
@@ -1331,7 +1332,9 @@ impl App {
             .or_else(|| {
                 self.interfaces
                     .iter()
-                    .find(|entry| !entry.name.starts_with("Loopback") && !entry.name.starts_with("BDI"))
+                    .find(|entry| {
+                        !entry.name.starts_with("Loopback") && !entry.name.starts_with("BDI")
+                    })
                     .map(|entry| expand_interface_name_for_os(&entry.name, CiscoOs::Ios))
             })
             .unwrap_or_else(|| "TenGigabitEthernet0/0/0".to_string());
@@ -1371,9 +1374,9 @@ impl App {
         if candidate_interfaces.is_empty() {
             return;
         }
-        let current_index = candidate_interfaces
-            .iter()
-            .position(|name| same_cisco_interface(name, &self.service_instance_form.parent_interface));
+        let current_index = candidate_interfaces.iter().position(|name| {
+            same_cisco_interface(name, &self.service_instance_form.parent_interface)
+        });
         let next_index = match current_index {
             Some(index) => (index + 1) % candidate_interfaces.len(),
             None => 0,
@@ -1383,8 +1386,16 @@ impl App {
 
     /// Validates and opens the confirmation modal for an ASR 900 service instance.
     pub fn confirm_service_instance_form(&mut self) {
-        if self.service_instance_form.parent_interface.trim().is_empty()
-            || self.service_instance_form.service_instance_id.trim().is_empty()
+        if self
+            .service_instance_form
+            .parent_interface
+            .trim()
+            .is_empty()
+            || self
+                .service_instance_form
+                .service_instance_id
+                .trim()
+                .is_empty()
         {
             self.status_message =
                 "Parent Interface and Service Instance ID are required.".to_string();
@@ -1440,8 +1451,7 @@ impl App {
     pub fn initiate_no_shutdown(&mut self) {
         let selected_name_option = self.selected_interface().map(|entry| entry.name.clone());
         if let Some(interface_name) = selected_name_option {
-            let generated_commands =
-                build_no_shutdown_script(&interface_name, self.connected_os);
+            let generated_commands = build_no_shutdown_script(&interface_name, self.connected_os);
             self.confirm_title = format!("ENABLE PORT (no shutdown) - {}", interface_name);
             self.confirm_action_description =
                 format!("Enable port (no shutdown) {}", interface_name);
@@ -1649,7 +1659,10 @@ impl App {
                 }
                 self.add_log(
                     LogLevel::Info,
-                    format!("Polled {} IOS-XE service instances from router", instance_count),
+                    format!(
+                        "Polled {} IOS-XE service instances from router",
+                        instance_count
+                    ),
                 );
             }
             SshResponse::ServiceInstances(Err(error_message)) => {
@@ -1759,8 +1772,10 @@ impl App {
                 result: Err(error_transcript),
             } => {
                 self.is_loading = false;
-                self.status_message =
-                    format!("[FAILED] {} (Showing router error details)", action_description);
+                self.status_message = format!(
+                    "[FAILED] {} (Showing router error details)",
+                    action_description
+                );
                 self.logs.push(ActionLog::with_details(
                     LogLevel::Error,
                     format!("Failed: {}", action_description),
@@ -1780,10 +1795,7 @@ impl App {
                 result: Ok(command_output),
             } => {
                 self.command_output = command_output;
-                self.add_log(
-                    LogLevel::Success,
-                    format!("Command succeeded: {}", command),
-                );
+                self.add_log(LogLevel::Success, format!("Command succeeded: {}", command));
             }
             SshResponse::CommandResult {
                 command,
@@ -1794,6 +1806,25 @@ impl App {
                     LogLevel::Error,
                     format!("Command failed: {} ({})", command, error_message),
                 );
+            }
+            SshResponse::HostKeyPrompt(prompt_details) => {
+                self.status_message = format!(
+                    "Unknown host key from {}:{}; waiting for your decision",
+                    prompt_details.host, prompt_details.port
+                );
+                self.add_log(
+                    LogLevel::Warning,
+                    format!(
+                        "Unknown host key {} {} from {}:{}",
+                        prompt_details.key_type,
+                        prompt_details.fingerprint,
+                        prompt_details.host,
+                        prompt_details.port
+                    ),
+                );
+                self.pending_host_key = Some(prompt_details);
+                self.previous_view = self.current_view;
+                self.current_view = CurrentView::HostKeyPrompt;
             }
             SshResponse::ConnectionError(error_message) => {
                 self.is_connected = false;
@@ -1817,6 +1848,28 @@ impl App {
                 self.add_log(LogLevel::Info, status_text);
             }
         }
+    }
+
+    /// Records the operator's answer to the host key prompt, lets the paused SSH handshake
+    /// continue (or abort), and returns to the screen that was showing before the prompt.
+    pub fn answer_host_key_prompt(&mut self, trusted: bool) {
+        self.host_key_decision.resolve(trusted);
+        self.pending_host_key = None;
+        self.current_view = self.previous_view;
+        let outcome = if trusted {
+            "Host key accepted and saved to known_hosts"
+        } else {
+            "Host key rejected; connection aborted"
+        };
+        self.status_message = outcome.to_string();
+        self.add_log(
+            if trusted {
+                LogLevel::Info
+            } else {
+                LogLevel::Warning
+            },
+            outcome,
+        );
     }
 
     /// Appends an entry to the audit log, discarding the oldest entry once 200 are stored

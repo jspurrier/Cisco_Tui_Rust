@@ -3,8 +3,8 @@ use crate::cisco::{
     parse_running_config_l2vpn, parse_show_interfaces_description, sanitize_pty_output,
 };
 use crate::model::{
-    CiscoOs, ConnectionConfig, InterfaceEntry, L2vpnServiceEntry, ServiceInstanceEntry, SshRequest,
-    SshResponse,
+    CiscoOs, ConnectionConfig, HostKeyPromptDetails, InterfaceEntry, L2vpnServiceEntry,
+    ServiceInstanceEntry, SshRequest, SshResponse,
 };
 use async_trait::async_trait;
 use russh::client::{self, Handle};
@@ -14,17 +14,30 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+/// How long to wait for the TCP connection to the router to open.
+const TCP_CONNECT_TIMEOUT_SECONDS: u64 = 10;
+/// How long the operator has to answer a host key prompt before it counts as "reject".
+const HOST_KEY_PROMPT_TIMEOUT_SECONDS: u64 = 120;
+/// How long the SSH handshake may take. It also covers the time the operator spends on the
+/// host key prompt, so it must be longer than `HOST_KEY_PROMPT_TIMEOUT_SECONDS`.
+const HANDSHAKE_TIMEOUT_SECONDS: u64 = HOST_KEY_PROMPT_TIMEOUT_SECONDS + 15;
+
 /// SSH client callback handler required by `russh`.
 ///
 /// Verifies the router's host key against the user's standard OpenSSH `~/.ssh/known_hosts`
-/// file using "trust on first use": a host seen for the first time is remembered, and any
-/// later connection that presents a different key is refused. This protects the login
-/// password and configuration session from a machine impersonating the router.
+/// file. A host seen for the first time is only remembered after the operator has compared
+/// its fingerprint and explicitly accepted it in the UI; a later connection that presents a
+/// different key is refused outright. This protects the login password and configuration
+/// session from a machine impersonating the router.
 struct RouterSshClientHandler {
     /// Hostname or IP address being connected to (the lookup key in `known_hosts`).
     target_host: String,
     /// TCP port being connected to (non-default ports are stored per host and port).
     target_port: u16,
+    /// Used to ask the UI whether an unknown host key should be trusted.
+    response_sender: mpsc::Sender<SshResponse>,
+    /// Slot the UI fills in with the operator's answer.
+    host_key_decision: Arc<HostKeyDecision>,
 }
 
 #[async_trait]
@@ -37,17 +50,30 @@ impl client::Handler for RouterSshClientHandler {
         &mut self,
         server_public_key: &russh_keys::key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        match russh_keys::check_known_hosts(
-            &self.target_host,
-            self.target_port,
-            server_public_key,
-        ) {
+        match russh_keys::check_known_hosts(&self.target_host, self.target_port, server_public_key)
+        {
             // Host is known and the key matches the stored one.
             Ok(true) => Ok(true),
-            // Host has never been seen before: remember its key for next time.
-            // A failure to save the key (for example a read-only home directory) does not
-            // block the connection, but the host will be treated as new again next time.
+            // Host has never been seen before: pause the handshake (no credentials have been
+            // sent yet) and let the operator compare the fingerprint before trusting it.
             Ok(false) => {
+                self.host_key_decision.reset();
+                let prompt_details = HostKeyPromptDetails {
+                    host: self.target_host.clone(),
+                    port: self.target_port,
+                    key_type: server_public_key.name().to_string(),
+                    fingerprint: format!("SHA256:{}", server_public_key.fingerprint()),
+                };
+                let prompt_was_delivered = self
+                    .response_sender
+                    .send(SshResponse::HostKeyPrompt(prompt_details))
+                    .await
+                    .is_ok();
+                if !prompt_was_delivered || !self.host_key_decision.wait().await {
+                    return Ok(false);
+                }
+                // A failure to save the key (for example a read-only home directory) does not
+                // block this connection, but the host will be asked about again next time.
                 let _ = russh_keys::learn_known_hosts(
                     &self.target_host,
                     self.target_port,
@@ -59,6 +85,65 @@ impl client::Handler for RouterSshClientHandler {
             // attack, or the router was legitimately re-keyed) or the file is unreadable.
             // Refuse the connection; the user must resolve it by editing `known_hosts`.
             Err(_) => Ok(false),
+        }
+    }
+}
+
+/// Shared slot through which the TUI answers a first-seen host key question.
+///
+/// The SSH handshake pauses on an unknown host key and waits here for the operator's trust
+/// decision. The connection is aborted before any credentials are sent unless they accept.
+pub struct HostKeyDecision {
+    /// `None` while the question is pending; `Some(true)` = trust, `Some(false)` = reject.
+    decision: std::sync::Mutex<Option<bool>>,
+    /// Wakes `wait` as soon as `resolve` stores an answer.
+    notify: tokio::sync::Notify,
+}
+
+impl HostKeyDecision {
+    /// Creates an empty slot, shared between the UI and the SSH worker.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            decision: std::sync::Mutex::new(None),
+            notify: tokio::sync::Notify::new(),
+        })
+    }
+
+    /// Locks the stored decision. A poisoned lock is safe to reuse because the guarded
+    /// value is a plain `Option<bool>` that can never be left half-updated.
+    fn lock_decision(&self) -> std::sync::MutexGuard<'_, Option<bool>> {
+        self.decision
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Clears any previous answer before a new question is asked.
+    pub fn reset(&self) {
+        *self.lock_decision() = None;
+    }
+
+    /// Called by the UI when the operator accepts or rejects the key.
+    pub fn resolve(&self, trusted: bool) {
+        *self.lock_decision() = Some(trusted);
+        // `notify_one` stores a permit, so an answer given just before `wait` starts
+        // listening is not lost (unlike `notify_waiters`).
+        self.notify.notify_one();
+    }
+
+    /// Waits for the operator's decision; no answer in time counts as "reject".
+    pub async fn wait(&self) -> bool {
+        let answer_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(HOST_KEY_PROMPT_TIMEOUT_SECONDS);
+        loop {
+            if let Some(trusted) = *self.lock_decision() {
+                return trusted;
+            }
+            if tokio::time::timeout_at(answer_deadline, self.notify.notified())
+                .await
+                .is_err()
+            {
+                return false;
+            }
         }
     }
 }
@@ -78,6 +163,8 @@ pub struct SshWorker {
     live_ssh_session: Option<Handle<RouterSshClientHandler>>,
     /// The simulated router, if the demo mode is active instead of a live session.
     mock_router: Option<MockCiscoRouter>,
+    /// Shared with the UI so the operator can answer a host key question mid-handshake.
+    host_key_decision: Arc<HostKeyDecision>,
 }
 
 impl SshWorker {
@@ -85,6 +172,7 @@ impl SshWorker {
     pub fn new(
         request_receiver: mpsc::Receiver<SshRequest>,
         response_sender: mpsc::Sender<SshResponse>,
+        host_key_decision: Arc<HostKeyDecision>,
     ) -> Self {
         Self {
             request_receiver,
@@ -93,6 +181,7 @@ impl SshWorker {
             live_ssh_channel: None,
             live_ssh_session: None,
             mock_router: None,
+            host_key_decision,
         }
     }
 
@@ -229,27 +318,60 @@ impl SshWorker {
             return;
         }
 
-        // Configure and initiate the live SSH TCP connection
-        let ssh_client_config = Arc::new(client::Config::default());
-        let connect_future = client::connect(
-            ssh_client_config,
-            (&connection_config.host[..], connection_config.port),
+        // Open the TCP connection first with a short timeout, so an unreachable router fails
+        // fast instead of waiting out the much longer SSH handshake window below.
+        let tcp_connect_attempt = tokio::time::timeout(
+            Duration::from_secs(TCP_CONNECT_TIMEOUT_SECONDS),
+            tokio::net::TcpStream::connect((&connection_config.host[..], connection_config.port)),
+        )
+        .await;
+        let tcp_stream = match tcp_connect_attempt {
+            Ok(Ok(opened_stream)) => opened_stream,
+            Ok(Err(connect_error)) => {
+                let _ = self
+                    .response_sender
+                    .send(SshResponse::ConnectionError(format!(
+                        "Unable to connect to {}:{}: {}",
+                        connection_config.host, connection_config.port, connect_error
+                    )))
+                    .await;
+                return;
+            }
+            Err(_) => {
+                let _ = self
+                    .response_sender
+                    .send(SshResponse::ConnectionError(format!(
+                        "Connection to {}:{} timed out after {} seconds",
+                        connection_config.host, connection_config.port, TCP_CONNECT_TIMEOUT_SECONDS
+                    )))
+                    .await;
+                return;
+            }
+        };
+
+        // Run the SSH handshake over that connection. The handler may pause it to ask the
+        // operator about an unknown host key.
+        let connect_future = client::connect_stream(
+            Arc::new(client::Config::default()),
+            tcp_stream,
             RouterSshClientHandler {
                 target_host: connection_config.host.clone(),
                 target_port: connection_config.port,
+                response_sender: self.response_sender.clone(),
+                host_key_decision: Arc::clone(&self.host_key_decision),
             },
         );
 
-        let connection_attempt =
-            tokio::time::timeout(Duration::from_secs(10), connect_future).await;
+        let connection_attempt = tokio::time::timeout(
+            Duration::from_secs(HANDSHAKE_TIMEOUT_SECONDS),
+            connect_future,
+        )
+        .await;
 
         match connection_attempt {
             Ok(Ok(mut ssh_session)) => {
                 let auth_result = ssh_session
-                    .authenticate_password(
-                        &connection_config.username,
-                        &connection_config.password,
-                    )
+                    .authenticate_password(&connection_config.username, &connection_config.password)
                     .await;
 
                 match auth_result {
@@ -364,7 +486,7 @@ impl SshWorker {
                 // A rejected host key surfaces as `UnknownKey`; explain it, since the raw
                 // error text gives the operator no hint about how to fix it.
                 let failure_reason = if matches!(connect_error, russh::Error::UnknownKey) {
-                    "host key does not match ~/.ssh/known_hosts (possible impersonation, or the router was re-keyed; remove the old entry only if you trust the change)".to_string()
+                    "host key was rejected: it either does not match ~/.ssh/known_hosts (possible impersonation, or the router was re-keyed; remove the old entry only if you trust the change) or you declined it at the prompt".to_string()
                 } else {
                     connect_error.to_string()
                 };
@@ -380,8 +502,8 @@ impl SshWorker {
                 let _ = self
                     .response_sender
                     .send(SshResponse::ConnectionError(format!(
-                        "Connection to {}:{} timed out after 10 seconds",
-                        connection_config.host, connection_config.port
+                        "SSH handshake with {}:{} timed out after {} seconds",
+                        connection_config.host, connection_config.port, HANDSHAKE_TIMEOUT_SECONDS
                     )))
                     .await;
             }
@@ -406,7 +528,7 @@ impl SshWorker {
                 let _ = self
                     .response_sender
                     .send(SshResponse::Interfaces(Err(
-                        "Not connected to a router".to_string(),
+                        "Not connected to a router".to_string()
                     )))
                     .await;
                 return;
@@ -468,7 +590,7 @@ impl SshWorker {
                 let _ = self
                     .response_sender
                     .send(SshResponse::L2vpnServices(Err(
-                        "Not connected to a router".to_string(),
+                        "Not connected to a router".to_string()
                     )))
                     .await;
                 return;
@@ -483,7 +605,7 @@ impl SshWorker {
         let is_ios_xe = self
             .active_connection_config
             .as_ref()
-            .map_or(false, |config| config.operating_system == CiscoOs::Ios);
+            .is_some_and(|config| config.operating_system == CiscoOs::Ios);
 
         if is_ios_xe {
             let command_text = "show running-config | section ^interface\n";
@@ -560,6 +682,17 @@ impl SshWorker {
             tokio::time::timeout(Duration::from_millis(20), ssh_channel.wait()).await
         {}
 
+        if let Err(rejection_reason) = reject_control_characters(&interface_name) {
+            let _ = self
+                .response_sender
+                .send(SshResponse::ConfigResult {
+                    interface_name,
+                    result: Err(rejection_reason),
+                })
+                .await;
+            return;
+        }
+
         let command_text = format!("show running-config interface {}\n", interface_name);
         if let Err(send_error) = ssh_channel.data(command_text.as_bytes()).await {
             let _ = self
@@ -612,6 +745,21 @@ impl SshWorker {
                 return;
             }
         };
+
+        // Validate every line up front so a bad line cannot leave a half-applied change.
+        if let Some(rejection_reason) = commands
+            .iter()
+            .find_map(|command_line| reject_control_characters(command_line.trim()).err())
+        {
+            let _ = self
+                .response_sender
+                .send(SshResponse::PushResult {
+                    action_description,
+                    result: Err(rejection_reason),
+                })
+                .await;
+            return;
+        }
 
         // Drain any lingering output before entering configuration mode
         while let Ok(Some(_)) =
@@ -708,7 +856,7 @@ impl SshWorker {
                     let is_ios_xr = self
                         .active_connection_config
                         .as_ref()
-                        .map_or(true, |config| config.operating_system == CiscoOs::IosXr);
+                        .is_none_or(|config| config.operating_system == CiscoOs::IosXr);
                     let exit_command = if is_ios_xr { "abort\n" } else { "end\n" };
                     let _ = ssh_channel.data(exit_command.as_bytes()).await;
                     let _ = read_channel_until_prompt_or_quiet(ssh_channel, 2_500).await;
@@ -720,9 +868,8 @@ impl SshWorker {
         let formatted_transcript = if encountered_cli_error {
             let mut report_sections = Vec::new();
             if !commit_failure_details.is_empty() {
-                report_sections.push(
-                    "!! ROUTER COMMIT REJECTED (show configuration failed) !!".to_string(),
-                );
+                report_sections
+                    .push("!! ROUTER COMMIT REJECTED (show configuration failed) !!".to_string());
                 report_sections
                     .push("--------------------------------------------------------".to_string());
                 report_sections.push(commit_failure_details);
@@ -788,6 +935,17 @@ impl SshWorker {
             }
         };
 
+        if let Err(rejection_reason) = reject_control_characters(command.trim()) {
+            let _ = self
+                .response_sender
+                .send(SshResponse::CommandResult {
+                    command,
+                    result: Err(rejection_reason),
+                })
+                .await;
+            return;
+        }
+
         let command_with_newline = format!("{}\n", command.trim());
         if let Err(send_error) = ssh_channel.data(command_with_newline.as_bytes()).await {
             let _ = self
@@ -810,6 +968,23 @@ impl SshWorker {
                 result: Ok(cleaned_output),
             })
             .await;
+    }
+}
+
+/// Security check applied to every line of text before it is typed into the router's shell.
+///
+/// The router treats a newline as "execute now" and other control characters (for example
+/// Ctrl-C or Ctrl-Z) as session controls. If an operator-typed value such as an interface
+/// description contained one, it could smuggle extra commands into the session. Any such
+/// character causes the whole request to be refused before anything is sent.
+fn reject_control_characters(text: &str) -> Result<(), String> {
+    match text.chars().find(|character| character.is_control()) {
+        Some(offending_character) => Err(format!(
+            "Refused to send input containing a control character (U+{:04X}); \
+             remove line breaks and control characters and try again.",
+            u32::from(offending_character)
+        )),
+        None => Ok(()),
     }
 }
 
@@ -1258,8 +1433,7 @@ impl MockCiscoRouter {
                         .retain(|entry| entry.name != target_to_delete);
                     self.running_configs.remove(target_to_delete);
                 }
-            } else if let Some(after_interface_keyword) =
-                trimmed_command.strip_prefix("interface ")
+            } else if let Some(after_interface_keyword) = trimmed_command.strip_prefix("interface ")
             {
                 let words: Vec<&str> = after_interface_keyword.split_whitespace().collect();
                 if let Some(first_word) = words.first() {
@@ -1397,8 +1571,7 @@ cisco ASR9001 (PowerPC) processor with 16777216K bytes of memory.
 4 TenGigE
 Uptime is 42 weeks, 3 days, 14 hours, 22 minutes"#
                 .to_string()
-        } else if lowercase_command.contains("show l2vpn")
-            || lowercase_command.contains("xconnect")
+        } else if lowercase_command.contains("show l2vpn") || lowercase_command.contains("xconnect")
         {
             r#"Legend: ST = State, UP = Up, DN = Down, AD = Admin Down, UR = Unresolved
 XC Name         Type  ST  Interface           Peer / VC ID
@@ -1412,5 +1585,58 @@ BETA_PW         p2p   UP  Te0/0/0/3.200       192.0.2.200 / 20002 (UP)"#
                 command_text
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reject_control_characters;
+
+    /// Ordinary configuration text, including punctuation and spaces, must pass.
+    #[test]
+    fn accepts_plain_command_text() {
+        assert!(reject_control_characters("description Uplink to core-1 (10G)").is_ok());
+    }
+
+    /// A line break, carriage return, Ctrl-C or Ctrl-Z would let one field inject extra
+    /// commands or abort the session, so each must be refused.
+    #[test]
+    fn rejects_line_breaks_and_control_characters() {
+        for malicious_text in ["a\nb", "a\rb", "a\u{3}b", "a\u{1a}b"] {
+            assert!(reject_control_characters(malicious_text).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod host_key_decision_tests {
+    use super::HostKeyDecision;
+
+    /// An answer given before `wait` starts listening must not be lost.
+    #[tokio::test]
+    async fn answer_given_before_waiting_is_delivered() {
+        let decision_slot = HostKeyDecision::new();
+        decision_slot.resolve(true);
+        assert!(decision_slot.wait().await);
+    }
+
+    /// A rejection from another task wakes the waiter and is reported as "do not trust".
+    #[tokio::test]
+    async fn rejection_from_another_task_wakes_the_waiter() {
+        let decision_slot = HostKeyDecision::new();
+        let answering_slot = std::sync::Arc::clone(&decision_slot);
+        tokio::spawn(async move { answering_slot.resolve(false) });
+        assert!(!decision_slot.wait().await);
+    }
+
+    /// `reset` clears a previous answer so it cannot leak into the next question.
+    #[tokio::test]
+    async fn reset_discards_previous_answer() {
+        let decision_slot = HostKeyDecision::new();
+        decision_slot.resolve(true);
+        decision_slot.reset();
+        let answering_slot = std::sync::Arc::clone(&decision_slot);
+        tokio::spawn(async move { answering_slot.resolve(false) });
+        assert!(!decision_slot.wait().await);
     }
 }

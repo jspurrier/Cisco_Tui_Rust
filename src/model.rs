@@ -334,8 +334,24 @@ pub enum SshResponse {
         /// The command output, or a readable error.
         result: Result<String, String>,
     },
+    /// The router presented a host key not yet in `known_hosts`; the SSH worker is paused
+    /// until the operator accepts or rejects it.
+    HostKeyPrompt(HostKeyPromptDetails),
     /// The connection failed or was lost; the UI should return to the login screen.
     ConnectionError(String),
     /// A progress message to show in the status bar.
     Status(String),
+}
+
+/// What the operator needs to see to decide whether to trust a router's SSH host key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostKeyPromptDetails {
+    /// Hostname or IP address being connected to.
+    pub host: String,
+    /// TCP port being connected to.
+    pub port: u16,
+    /// Key algorithm, for example `ssh-ed25519`.
+    pub key_type: String,
+    /// SHA-256 fingerprint of the key, to compare against a trusted source.
+    pub fingerprint: String,
 }

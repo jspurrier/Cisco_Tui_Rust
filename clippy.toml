@@ -1,0 +1,3 @@
+# Tests may unwrap/expect: a failed assertion panicking is the desired behaviour there.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

@@ -31,7 +31,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_header_banner(frame, app, main_vertical_sections[0]);
 
     let show_l2vpn_background = app.current_view == CurrentView::L2vpnList
-        || (app.current_view == CurrentView::EditL2vpn && app.previous_view == CurrentView::L2vpnList)
+        || (app.current_view == CurrentView::EditL2vpn
+            && app.previous_view == CurrentView::L2vpnList)
         || (app.current_view == CurrentView::ConfirmAction
             && (app.previous_view == CurrentView::L2vpnList
                 || (app.previous_view == CurrentView::EditL2vpn
@@ -57,9 +58,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     // Render the active modal overlay on top of the main table
     match app.current_view {
-        CurrentView::InterfaceList
-        | CurrentView::L2vpnList
-        | CurrentView::ServiceInstanceList => {}
+        CurrentView::InterfaceList | CurrentView::L2vpnList | CurrentView::ServiceInstanceList => {}
         CurrentView::ViewConfig => render_view_config_modal(frame, app),
         CurrentView::EditInterface => render_edit_interface_modal(frame, app),
         CurrentView::EditL2vpn => render_edit_l2vpn_modal(frame, app),
@@ -69,6 +68,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         CurrentView::CommandRunner => render_command_runner_modal(frame, app),
         CurrentView::ActionLogs => render_action_logs_modal(frame, app),
         CurrentView::Help => render_help_modal(frame),
+        CurrentView::HostKeyPrompt => render_host_key_modal(frame, app),
     }
 }
 
@@ -405,8 +405,7 @@ fn render_l2vpn_table(frame: &mut Frame, app: &mut App, content_area: Rect) {
                 peers_and_bvi_parts.push(service.routed_bvi.clone());
             }
             for neighbor in &service.neighbors {
-                peers_and_bvi_parts
-                    .push(format!("{} (pw:{})", neighbor.peer_ipv4, neighbor.pw_id));
+                peers_and_bvi_parts.push(format!("{} (pw:{})", neighbor.peer_ipv4, neighbor.pw_id));
             }
             if !service.mtu.is_empty() {
                 peers_and_bvi_parts.push(format!("MTU:{}", service.mtu));
@@ -414,11 +413,8 @@ fn render_l2vpn_table(frame: &mut Frame, app: &mut App, content_area: Rect) {
             let peers_summary = peers_and_bvi_parts.join(" | ");
 
             Row::new(vec![
-                Cell::from(type_badge).style(
-                    Style::default()
-                        .fg(type_color)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Cell::from(type_badge)
+                    .style(Style::default().fg(type_color).add_modifier(Modifier::BOLD)),
                 Cell::from(service.group_name.clone()).style(Style::default().fg(Color::Yellow)),
                 Cell::from(service.service_name.clone()).style(
                     Style::default()
@@ -688,7 +684,11 @@ fn render_footer_bar(frame: &mut Frame, app: &App, footer_area: Rect) {
             Span::styled("[n]", Style::default().fg(Color::Magenta)),
             Span::raw(" Subport "),
             Span::styled("[b]", Style::default().fg(Color::Cyan)),
-            Span::raw(if is_ios_xe { " Add/Edit SI " } else { " Bind L2VPN " }),
+            Span::raw(if is_ios_xe {
+                " Add/Edit SI "
+            } else {
+                " Bind L2VPN "
+            }),
             Span::styled("[w]", Style::default().fg(Color::Magenta)),
             Span::raw(if is_ios_xe { " Services " } else { " L2VPN " }),
             Span::styled("[x]", Style::default().fg(Color::LightRed)),
@@ -1076,8 +1076,8 @@ fn render_edit_interface_modal(frame: &mut Frame, app: &App) {
     } else {
         ""
     };
-    let vlan_id_widget =
-        Paragraph::new(format!(" {}{}", app.editor_form.vlan_id, vlan_id_cursor)).block(
+    let vlan_id_widget = Paragraph::new(format!(" {}{}", app.editor_form.vlan_id, vlan_id_cursor))
+        .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(vlan_id_border)
@@ -1173,10 +1173,7 @@ fn render_edit_interface_modal(frame: &mut Frame, app: &App) {
         ""
     };
     let mtu_display_text = if app.editor_form.mtu.is_empty() && app.editor_active_field != 9 {
-        Span::styled(
-            " (blank = omit)",
-            Style::default().fg(Color::DarkGray),
-        )
+        Span::styled(" (blank = omit)", Style::default().fg(Color::DarkGray))
     } else {
         Span::styled(
             format!(" {}{}", app.editor_form.mtu, mtu_cursor),
@@ -1458,22 +1455,21 @@ fn render_edit_l2vpn_modal(frame: &mut Frame, app: &App) {
         .iter()
         .filter(|service| service.service_type == app.l2vpn_form.service_type)
         .count();
-    let picker_label = if !app.l2vpn_form.group_name.is_empty()
-        && !app.l2vpn_form.service_name.is_empty()
-    {
-        format!(
-            " ◄ {} / {} ► ({} on router — Space to cycle)",
-            app.l2vpn_form.group_name, app.l2vpn_form.service_name, matching_count
-        )
-    } else if matching_count > 0 {
-        format!(
-            " ◄ Press Space to pick from {} existing {}s ►",
-            matching_count,
-            app.l2vpn_form.service_type.short_label()
-        )
-    } else {
-        " (No existing services cached — type Group & Name below)".to_string()
-    };
+    let picker_label =
+        if !app.l2vpn_form.group_name.is_empty() && !app.l2vpn_form.service_name.is_empty() {
+            format!(
+                " ◄ {} / {} ► ({} on router — Space to cycle)",
+                app.l2vpn_form.group_name, app.l2vpn_form.service_name, matching_count
+            )
+        } else if matching_count > 0 {
+            format!(
+                " ◄ Press Space to pick from {} existing {}s ►",
+                matching_count,
+                app.l2vpn_form.service_type.short_label()
+            )
+        } else {
+            " (No existing services cached — type Group & Name below)".to_string()
+        };
     let picker_widget = Paragraph::new(Span::styled(
         picker_label,
         Style::default()
@@ -1504,16 +1500,13 @@ fn render_edit_l2vpn_modal(frame: &mut Frame, app: &App) {
         L2vpnServiceType::BridgeDomain => " [2] Bridge Group (e.g. CORP_GROUP) ",
         L2vpnServiceType::XconnectP2p => " [2] Xconnect Group (e.g. METRO_XC) ",
     };
-    let group_widget = Paragraph::new(format!(
-        " {}{}",
-        app.l2vpn_form.group_name, group_cursor
-    ))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(group_border)
-            .title(group_title),
-    );
+    let group_widget = Paragraph::new(format!(" {}{}", app.l2vpn_form.group_name, group_cursor))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(group_border)
+                .title(group_title),
+        );
     frame.render_widget(group_widget, row_two_columns[0]);
 
     let service_border = if app.l2vpn_active_field == 3 {
@@ -1636,9 +1629,7 @@ fn render_edit_l2vpn_modal(frame: &mut Frame, app: &App) {
         L2vpnServiceType::BridgeDomain => {
             " [6] VFI Neighbors (Optional, comma-sep '<IP> <pw-id>': e.g. 10.0.0.1 10) "
         }
-        L2vpnServiceType::XconnectP2p => {
-            " [6] P2P Neighbor ('<IP> <pw-id>': e.g. 10.0.0.2 100) "
-        }
+        L2vpnServiceType::XconnectP2p => " [6] P2P Neighbor ('<IP> <pw-id>': e.g. 10.0.0.2 100) ",
     };
     let neighbors_widget = Paragraph::new(format!(
         " {}{}",
@@ -1668,13 +1659,12 @@ fn render_edit_l2vpn_modal(frame: &mut Frame, app: &App) {
         unfocused_border_style
     };
     let bvi_cursor = if app.l2vpn_active_field == 7 { "_" } else { "" };
-    let bvi_widget = Paragraph::new(format!(" {}{}", app.l2vpn_form.routed_bvi, bvi_cursor))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(bvi_border)
-                .title(" [7] Routed BVI (Opt: e.g. BVI10) "),
-        );
+    let bvi_widget = Paragraph::new(format!(" {}{}", app.l2vpn_form.routed_bvi, bvi_cursor)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(bvi_border)
+            .title(" [7] Routed BVI (Opt: e.g. BVI10) "),
+    );
     frame.render_widget(bvi_widget, row_five_columns[0]);
 
     let bridge_domain_mtu_border = if app.l2vpn_active_field == 8 {
@@ -2049,11 +2039,17 @@ fn render_edit_service_instance_modal(frame: &mut Frame, app: &App) {
     let (target_title, target_value) = match app.service_instance_form.binding_type {
         ServiceInstanceBinding::Xconnect => (
             " [7] Xconnect Peer IP (e.g. 10.0.0.1) ",
-            format!("{}{}", app.service_instance_form.xconnect_peer_ip, target_cursor),
+            format!(
+                "{}{}",
+                app.service_instance_form.xconnect_peer_ip, target_cursor
+            ),
         ),
         ServiceInstanceBinding::BridgeDomain => (
             " [7] Bridge-Domain ID (e.g. 10) ",
-            format!("{}{}", app.service_instance_form.bridge_domain_id, target_cursor),
+            format!(
+                "{}{}",
+                app.service_instance_form.bridge_domain_id, target_cursor
+            ),
         ),
         ServiceInstanceBinding::None => (
             " [7] Peer IP / BD ID (Unused) ",
@@ -2081,7 +2077,10 @@ fn render_edit_service_instance_modal(frame: &mut Frame, app: &App) {
     let (extra_title, extra_value) = match app.service_instance_form.binding_type {
         ServiceInstanceBinding::Xconnect => (
             " [8] PW VC-ID (e.g. 100) ",
-            format!(" {}{}", app.service_instance_form.xconnect_pw_id, extra_cursor),
+            format!(
+                " {}{}",
+                app.service_instance_form.xconnect_pw_id, extra_cursor
+            ),
         ),
         ServiceInstanceBinding::BridgeDomain => (
             " [8] Split-Horizon (Space) ",
@@ -2091,10 +2090,7 @@ fn render_edit_service_instance_modal(frame: &mut Frame, app: &App) {
                 " ( ) split-horizon  (•) Off".to_string()
             },
         ),
-        ServiceInstanceBinding::None => (
-            " [8] PW ID / Split-Horizon ",
-            " (unused)".to_string(),
-        ),
+        ServiceInstanceBinding::None => (" [8] PW ID / Split-Horizon ", " (unused)".to_string()),
     };
     let extra_widget = Paragraph::new(extra_value).block(
         Block::default()
@@ -2110,7 +2106,9 @@ fn render_edit_service_instance_modal(frame: &mut Frame, app: &App) {
         .iter()
         .map(|command_line| {
             let trimmed = command_line.trim();
-            let style = if command_line.starts_with("configure") || command_line.starts_with("interface ") {
+            let style = if command_line.starts_with("configure")
+                || command_line.starts_with("interface ")
+            {
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
@@ -2364,8 +2362,8 @@ fn render_connection_modal(frame: &mut Frame, app: &App) {
     } else {
         ""
     };
-    let port_input_widget =
-        Paragraph::new(format!(" {}{}", app.connection_port, port_cursor)).block(
+    let port_input_widget = Paragraph::new(format!(" {}{}", app.connection_port, port_cursor))
+        .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(port_border)
@@ -2435,17 +2433,16 @@ fn render_command_runner_modal(frame: &mut Frame, app: &App) {
         .title(" Execute Cisco CLI Command ");
     frame.render_widget(outer_modal_block, modal_area);
 
-    let command_input_widget = Paragraph::new(format!("Router# {}_", app.command_input))
-        .style(
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )
-        .block(
-            Block::default().borders(Borders::ALL).title(
+    let command_input_widget =
+        Paragraph::new(format!("Router# {}_", app.command_input))
+            .style(
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .block(Block::default().borders(Borders::ALL).title(
                 " Command (e.g. 'show ip int brief', 'show ipv4 int brief', 'show version') ",
-            ),
-        );
+            ));
     frame.render_widget(command_input_widget, modal_sections[0]);
 
     let output_lines: Vec<Line> = app
@@ -2456,12 +2453,10 @@ fn render_command_runner_modal(frame: &mut Frame, app: &App) {
         .collect();
 
     let command_output_widget = Paragraph::new(output_lines)
-        .block(
-            Block::default().borders(Borders::ALL).title(format!(
-                " Command Output (Line {}) ",
-                app.command_scroll + 1
-            )),
-        )
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            " Command Output (Line {}) ",
+            app.command_scroll + 1
+        )))
         .wrap(Wrap { trim: false });
     frame.render_widget(command_output_widget, modal_sections[1]);
 
@@ -2587,11 +2582,7 @@ fn render_help_modal(frame: &mut Frame) {
 }
 
 /// Computes a centered rectangle occupying `percent_width` x `percent_height` of `container_area`.
-fn centered_percentage_rect(
-    percent_width: u16,
-    percent_height: u16,
-    container_area: Rect,
-) -> Rect {
+fn centered_percentage_rect(percent_width: u16, percent_height: u16, container_area: Rect) -> Rect {
     let vertical_bands = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -2637,4 +2628,47 @@ fn centered_exact_rect(target_width: u16, target_height: u16, container_area: Re
             Constraint::Min(0),
         ])
         .split(vertical_sections[1])[1]
+}
+
+/// Draws the popup shown when a router presents an SSH host key not yet in `known_hosts`.
+/// Nothing is sent to the router until the operator answers.
+fn render_host_key_modal(frame: &mut Frame, app: &App) {
+    let Some(host_key_details) = app.pending_host_key.as_ref() else {
+        return;
+    };
+
+    let modal_area = centered_exact_rect(78, 15, frame.size());
+    frame.render_widget(Clear, modal_area);
+
+    let prompt_lines = vec![
+        Line::from(""),
+        Line::from(format!(
+            "  The authenticity of {}:{} cannot be established.",
+            host_key_details.host, host_key_details.port
+        )),
+        Line::from(""),
+        Line::from(format!("  Key type    : {}", host_key_details.key_type)),
+        Line::from(format!("  Fingerprint : {}", host_key_details.fingerprint)),
+        Line::from(""),
+        Line::from("  Compare the fingerprint with one from a trusted source (for example"),
+        Line::from("  `show crypto key mypubkey` on the router console) before accepting."),
+        Line::from("  Accepting saves the key to ~/.ssh/known_hosts. Your password has NOT"),
+        Line::from("  been sent yet."),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  [y] Trust and continue        [n] / [Esc] Reject (default)",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ];
+
+    let prompt_paragraph = Paragraph::new(prompt_lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Double)
+            .border_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+            .title(" UNKNOWN SSH HOST KEY "),
+    );
+    frame.render_widget(prompt_paragraph, modal_area);
 }

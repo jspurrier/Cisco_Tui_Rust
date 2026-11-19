@@ -34,25 +34,25 @@ pub fn parse_show_interfaces_description(raw_output: &str) -> Vec<InterfaceEntry
 
         // Determine where the status and protocol columns end and where the description begins.
         // Cisco outputs "admin down" or "administratively down" as two separate words.
-        let (physical_status, line_protocol, description_start_index) =
-            if columns[1].eq_ignore_ascii_case("admin")
-                || columns[1].eq_ignore_ascii_case("administratively")
-            {
-                let second_word_is_down = columns
-                    .get(2)
-                    .map_or(false, |word| word.eq_ignore_ascii_case("down"));
-                if second_word_is_down {
-                    let protocol = columns.get(3).unwrap_or(&"down").to_string();
-                    ("admin down".to_string(), protocol, 4)
-                } else {
-                    let protocol = columns.get(2).unwrap_or(&"down").to_string();
-                    ("admin down".to_string(), protocol, 3)
-                }
+        let (physical_status, line_protocol, description_start_index) = if columns[1]
+            .eq_ignore_ascii_case("admin")
+            || columns[1].eq_ignore_ascii_case("administratively")
+        {
+            let second_word_is_down = columns
+                .get(2)
+                .is_some_and(|word| word.eq_ignore_ascii_case("down"));
+            if second_word_is_down {
+                let protocol = columns.get(3).unwrap_or(&"down").to_string();
+                ("admin down".to_string(), protocol, 4)
             } else {
-                let status = columns[1].to_string();
                 let protocol = columns.get(2).unwrap_or(&"down").to_string();
-                (status, protocol, 3)
-            };
+                ("admin down".to_string(), protocol, 3)
+            }
+        } else {
+            let status = columns[1].to_string();
+            let protocol = columns.get(2).unwrap_or(&"down").to_string();
+            (status, protocol, 3)
+        };
 
         let description = if columns.len() > description_start_index {
             columns[description_start_index..].join(" ")
@@ -752,16 +752,10 @@ pub fn build_unified_interface_script(
         };
         if old_pop != new_pop {
             if old_pop > 0 {
-                command_list.push(format!(
-                    " no rewrite ingress tag pop {} symmetric",
-                    old_pop
-                ));
+                command_list.push(format!(" no rewrite ingress tag pop {} symmetric", old_pop));
             }
             if new_pop > 0 {
-                command_list.push(format!(
-                    " rewrite ingress tag pop {} symmetric",
-                    new_pop
-                ));
+                command_list.push(format!(" rewrite ingress tag pop {} symmetric", new_pop));
             }
         }
 
@@ -1164,10 +1158,7 @@ pub fn find_l2vpn_for_interface<'a>(
         if !service.routed_bvi.is_empty()
             && same_cisco_interface(interface_name, &service.routed_bvi)
         {
-            let badge = format!(
-                "BD: {}/{} [BVI]",
-                service.group_name, service.service_name
-            );
+            let badge = format!("BD: {}/{} [BVI]", service.group_name, service.service_name);
             return Some((service, badge));
         }
 
@@ -1189,10 +1180,7 @@ pub fn find_l2vpn_for_interface<'a>(
                     }
                     L2vpnServiceType::BridgeDomain => {
                         if attached.split_horizon_group {
-                            format!(
-                                "BD: {}/{} [SHG]",
-                                service.group_name, service.service_name
-                            )
+                            format!("BD: {}/{} [SHG]", service.group_name, service.service_name)
                         } else {
                             format!("BD: {}/{}", service.group_name, service.service_name)
                         }
@@ -1298,7 +1286,10 @@ impl L2vpnEditorForm {
             L2vpnServiceType::XconnectP2p => {
                 let neighbors = parse_l2vpn_neighbors(&self.neighbors_input);
                 if let Some(first) = neighbors.first() {
-                    format!("XC: {}/{} ({}:{})", group, service, first.peer_ipv4, first.pw_id)
+                    format!(
+                        "XC: {}/{} ({}:{})",
+                        group, service, first.peer_ipv4, first.pw_id
+                    )
                 } else {
                     format!("XC: {}/{}", group, service)
                 }
@@ -1338,13 +1329,15 @@ pub fn build_l2vpn_inner_commands(form: &L2vpnEditorForm) -> Vec<String> {
                     if form.interface_action == 2 {
                         lines.push(format!("   no interface {}", full_target_interface));
                     } else {
-                        let already_attached = previous
-                            .interfaces
-                            .iter()
-                            .any(|item| same_cisco_interface(&item.interface_name, &full_target_interface));
+                        let already_attached = previous.interfaces.iter().any(|item| {
+                            same_cisco_interface(&item.interface_name, &full_target_interface)
+                        });
                         if !already_attached {
                             for old_interface in &previous.interfaces {
-                                lines.push(format!("   no interface {}", old_interface.interface_name));
+                                lines.push(format!(
+                                    "   no interface {}",
+                                    old_interface.interface_name
+                                ));
                             }
                             lines.push(format!("   interface {}", full_target_interface));
                         }
@@ -1410,10 +1403,9 @@ pub fn build_l2vpn_inner_commands(form: &L2vpnEditorForm) -> Vec<String> {
 
                 // 2. Target Subinterface Attachment / Split-Horizon / Removal (delta)
                 if !full_target_interface.is_empty() {
-                    let existing_attachment = previous
-                        .interfaces
-                        .iter()
-                        .find(|item| same_cisco_interface(&item.interface_name, &full_target_interface));
+                    let existing_attachment = previous.interfaces.iter().find(|item| {
+                        same_cisco_interface(&item.interface_name, &full_target_interface)
+                    });
 
                     let canonical_name = existing_attachment
                         .map(|item| item.interface_name.as_str())
@@ -1430,7 +1422,9 @@ pub fn build_l2vpn_inner_commands(form: &L2vpnEditorForm) -> Vec<String> {
                                     lines.push("    split-horizon group".to_string());
                                 }
                             }
-                            Some(existing) if existing.split_horizon_group != want_split_horizon => {
+                            Some(existing)
+                                if existing.split_horizon_group != want_split_horizon =>
+                            {
                                 lines.push(format!("   interface {}", canonical_name));
                                 if want_split_horizon {
                                     lines.push("    split-horizon group".to_string());
@@ -1569,8 +1563,7 @@ pub fn build_delete_subinterface_with_l2vpn_script(
                             .push(format!("   no interface {}", attached.interface_name));
                     }
                     L2vpnServiceType::XconnectP2p => {
-                        l2vpn_cleanup_lines
-                            .push(format!(" xconnect group {}", service.group_name));
+                        l2vpn_cleanup_lines.push(format!(" xconnect group {}", service.group_name));
                         l2vpn_cleanup_lines.push(format!("  p2p {}", service.service_name));
                         l2vpn_cleanup_lines
                             .push(format!("   no interface {}", attached.interface_name));
@@ -1741,7 +1734,10 @@ pub fn format_service_instance_summary(
             }
             ServiceInstanceBinding::None => format!("VLAN {}", first.vlan_id),
         };
-        Some(format!("SI {}: {}", first.service_instance_id, binding_summary))
+        Some(format!(
+            "SI {}: {}",
+            first.service_instance_id, binding_summary
+        ))
     } else {
         let ids: Vec<&str> = matching
             .iter()
@@ -1749,7 +1745,12 @@ pub fn format_service_instance_summary(
             .map(|entry| entry.service_instance_id.as_str())
             .collect();
         let suffix = if matching.len() > 3 { ", ..." } else { "" };
-        Some(format!("{} SIs ({}{})", matching.len(), ids.join(", "), suffix))
+        Some(format!(
+            "{} SIs ({}{})",
+            matching.len(),
+            ids.join(", "),
+            suffix
+        ))
     }
 }
 
@@ -1857,8 +1858,7 @@ pub fn build_service_instance_script(form: &ServiceInstanceEditorForm) -> Vec<St
         if !trimmed_description.is_empty() {
             commands.push(format!("  description {}", trimmed_description));
         }
-        let encapsulation =
-            format_dot1q_encapsulation_clause(&form.vlan_id, &form.second_vlan_id);
+        let encapsulation = format_dot1q_encapsulation_clause(&form.vlan_id, &form.second_vlan_id);
         if !encapsulation.is_empty() {
             commands.push(format!("  {}", encapsulation));
         }
@@ -1926,7 +1926,10 @@ pub fn build_delete_service_instance_script(
     vec![
         "configure terminal".to_string(),
         format!("interface {}", parent),
-        format!(" no service instance {} ethernet", service_instance_id.trim()),
+        format!(
+            " no service instance {} ethernet",
+            service_instance_id.trim()
+        ),
         "end".to_string(),
     ]
 }
@@ -2376,13 +2379,12 @@ interface TenGigE0/1/0/1.10002000 l2transport
         };
 
         let generated_script = build_unified_interface_script(&editor_form, CiscoOs::IosXr);
-        assert!(generated_script
-            .contains(&"interface Te0/1/0/1.10002000 l2transport".to_string()));
+        assert!(generated_script.contains(&"interface Te0/1/0/1.10002000 l2transport".to_string()));
         assert!(generated_script.contains(&" description Customer Metro ELAN".to_string()));
-        assert!(generated_script
-            .contains(&" encapsulation dot1q 1000 second-dot1q 2000".to_string()));
-        assert!(generated_script
-            .contains(&" rewrite ingress tag pop 2 symmetric".to_string()));
+        assert!(
+            generated_script.contains(&" encapsulation dot1q 1000 second-dot1q 2000".to_string())
+        );
+        assert!(generated_script.contains(&" rewrite ingress tag pop 2 symmetric".to_string()));
         assert!(!generated_script
             .iter()
             .any(|line| line.contains("shutdown")));
@@ -2424,12 +2426,11 @@ interface TenGigE0/1/0/1.10002000 l2transport
         assert!(generated_script.contains(&" no description".to_string()));
         assert!(generated_script
             .contains(&" no encapsulation dot1q 1000 second-dot1q 2000".to_string()));
-        assert!(generated_script
-            .contains(&" encapsulation dot1q 1000 second-dot1q 2001".to_string()));
-        assert!(generated_script
-            .contains(&" no rewrite ingress tag pop 2 symmetric".to_string()));
-        assert!(generated_script
-            .contains(&" rewrite ingress tag pop 1 symmetric".to_string()));
+        assert!(
+            generated_script.contains(&" encapsulation dot1q 1000 second-dot1q 2001".to_string())
+        );
+        assert!(generated_script.contains(&" no rewrite ingress tag pop 2 symmetric".to_string()));
+        assert!(generated_script.contains(&" rewrite ingress tag pop 1 symmetric".to_string()));
         assert!(generated_script.contains(&" no mtu 9216".to_string()));
         assert!(generated_script.contains(&" no negotiation auto".to_string()));
 
@@ -2441,8 +2442,8 @@ interface TenGigE0/1/0/1.10002000 l2transport
         assert!(!is_deletable_subinterface("Bundle-Ether1"));
 
         assert!(build_delete_subinterface_script("Gi0/0/0/1", CiscoOs::IosXr).is_err());
-        let delete_script =
-            build_delete_subinterface_script("Te0/1/0/1.10002000", CiscoOs::IosXr).unwrap();
+        let delete_script = build_delete_subinterface_script("Te0/1/0/1.10002000", CiscoOs::IosXr)
+            .expect("sub-interface with VLAN tags should be deletable");
         assert_eq!(
             delete_script,
             vec![
@@ -2530,7 +2531,7 @@ interface TenGigE0/1/0/1.10002000 l2transport
 
         // Short interface name lookup should match full interface names
         let (matched_xconnect, xconnect_badge) =
-            find_l2vpn_for_interface("Gi0/0/0/1.100", &services).unwrap();
+            find_l2vpn_for_interface("Gi0/0/0/1.100", &services).expect("xconnect should match");
         assert_eq!(matched_xconnect.service_name, "CUSTOMER_SITE_A");
         assert_eq!(
             xconnect_badge,
@@ -2538,14 +2539,17 @@ interface TenGigE0/1/0/1.10002000 l2transport
         );
 
         let (matched_bridge_domain, bridge_domain_badge) =
-            find_l2vpn_for_interface("BE10.200", &services).unwrap();
+            find_l2vpn_for_interface("BE10.200", &services).expect("bridge domain should match");
         assert_eq!(matched_bridge_domain.service_name, "CORP_VOICE");
-        assert_eq!(bridge_domain_badge, "BD: ENTERPRISE_SERVICES/CORP_VOICE [SHG]");
+        assert_eq!(
+            bridge_domain_badge,
+            "BD: ENTERPRISE_SERVICES/CORP_VOICE [SHG]"
+        );
 
         // Deleting a subinterface that belongs to a Bridge-Domain should clean up L2VPN as well
         let delete_script =
             build_delete_subinterface_with_l2vpn_script("BE10.200", &services, CiscoOs::IosXr)
-                .unwrap();
+                .expect("delete script should build");
         assert!(delete_script.contains(&"no interface BE10.200".to_string()));
         assert!(delete_script.contains(&"l2vpn".to_string()));
         assert!(delete_script.contains(&" bridge group ENTERPRISE_SERVICES".to_string()));

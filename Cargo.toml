@@ -14,6 +14,12 @@ futures = "0.3"
 anyhow = "1.0"
 chrono = "0.4"
 
+# Lint policy: a panic inside the TUI would leave the user's terminal in raw mode, so
+# `unwrap`/`expect` are forbidden in production code (tests are exempt via `clippy.toml`).
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
 [profile.release]
 opt-level = 3
 debug = false

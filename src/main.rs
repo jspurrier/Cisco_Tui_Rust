@@ -14,9 +14,10 @@ use model::{
     CiscoOs, ConnectionConfig, L2vpnServiceType, ServiceInstanceBinding, SshRequest, SshResponse,
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
-use ssh::SshWorker;
+use ssh::{HostKeyDecision, SshWorker};
 use std::env;
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -107,9 +108,7 @@ OPTIONS:
     --host <HOST>       Router hostname or IP address
     --port <PORT>       SSH port (default: 22)
     --user <USERNAME>   SSH username
-    --pass <PASSWORD>   SSH password (visible in the process list and shell history;
-                        prefer the CISCO_TUI_PASSWORD environment variable or the
-                        interactive login screen)
+    (The password is entered on the masked login screen; it is never a command-line option.)
     --os <ios|ios-xr>   Initial Cisco OS mode: 'ios' (IOS/IOS-XE) or 'ios-xr' (default: ios-xr)
     --demo, --mock      Start in offline simulated router mode
     -h, --help          Print this help message
@@ -143,9 +142,6 @@ fn parse_command_line_arguments() -> (Option<ConnectionConfig>, bool) {
     let mut target_host: Option<String> = None;
     let mut ssh_port: u16 = 22;
     let mut ssh_username: Option<String> = None;
-    // The password may come from the environment so it never appears in the process list;
-    // an explicit `--pass` flag (parsed below) overrides it.
-    let mut ssh_password: Option<String> = env::var("CISCO_TUI_PASSWORD").ok();
     let mut operating_system = CiscoOs::IosXr;
     let mut use_mock_router = false;
 
@@ -177,22 +173,14 @@ fn parse_command_line_arguments() -> (Option<ConnectionConfig>, bool) {
                     arg_index += 1;
                 }
             }
-            "--pass" => {
-                if arg_index + 1 < command_line_args.len() {
-                    ssh_password = Some(command_line_args[arg_index + 1].clone());
-                    arg_index += 1;
+            "--os" if arg_index + 1 < command_line_args.len() => {
+                let os_argument = command_line_args[arg_index + 1].to_lowercase();
+                if os_argument == "ios" || os_argument == "ios-xe" || os_argument == "xe" {
+                    operating_system = CiscoOs::Ios;
+                } else {
+                    operating_system = CiscoOs::IosXr;
                 }
-            }
-            "--os" => {
-                if arg_index + 1 < command_line_args.len() {
-                    let os_argument = command_line_args[arg_index + 1].to_lowercase();
-                    if os_argument == "ios" || os_argument == "ios-xe" || os_argument == "xe" {
-                        operating_system = CiscoOs::Ios;
-                    } else {
-                        operating_system = CiscoOs::IosXr;
-                    }
-                    arg_index += 1;
-                }
+                arg_index += 1;
             }
             _ => {}
         }
@@ -204,7 +192,7 @@ fn parse_command_line_arguments() -> (Option<ConnectionConfig>, bool) {
             host: target_host.unwrap_or_else(|| "cisco-asr9k-core01".to_string()),
             port: ssh_port,
             username: ssh_username.unwrap_or_else(|| "admin".to_string()),
-            password: ssh_password.unwrap_or_default(),
+            password: String::new(),
             operating_system,
             use_mock_router: true,
         };
@@ -214,7 +202,7 @@ fn parse_command_line_arguments() -> (Option<ConnectionConfig>, bool) {
             host,
             port: ssh_port,
             username,
-            password: ssh_password.unwrap_or_default(),
+            password: String::new(),
             operating_system,
             use_mock_router: false,
         };
@@ -237,13 +225,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (ssh_response_sender, mut ssh_response_receiver) = mpsc::channel::<SshResponse>(32);
 
     // Spawn the background SSH client worker
-    let ssh_worker = SshWorker::new(ssh_request_receiver, ssh_response_sender);
+    // Shared answer slot for the "trust this unknown SSH host key?" prompt
+    let host_key_decision = HostKeyDecision::new();
+    let ssh_worker = SshWorker::new(
+        ssh_request_receiver,
+        ssh_response_sender,
+        Arc::clone(&host_key_decision),
+    );
     tokio::spawn(async move {
         ssh_worker.run().await;
     });
 
     let mut app = App::new(
         ssh_request_sender.clone(),
+        host_key_decision,
         initial_connection_config.clone(),
     );
 
@@ -533,9 +528,7 @@ fn handle_keyboard_input(app: &mut App, key_event: event::KeyEvent) {
                     KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char('b') => {
                         app.initiate_edit_selected_service_instance()
                     }
-                    KeyCode::Char('n') | KeyCode::Char('a') => {
-                        app.initiate_add_service_instance()
-                    }
+                    KeyCode::Char('n') | KeyCode::Char('a') => app.initiate_add_service_instance(),
                     KeyCode::Char('x') | KeyCode::Delete => {
                         app.initiate_delete_selected_service_instance()
                     }
@@ -645,28 +638,28 @@ fn handle_keyboard_input(app: &mut App, key_event: event::KeyEvent) {
                 // Down Arrow moves vertically to the corresponding field in the row below
                 KeyCode::Down => {
                     app.editor_active_field = match app.editor_active_field {
-                        0 | 1 => 2,      // Row 1 (Interface / Port State) -> Row 2 (Description)
-                        2 => 3,          // Row 2 (Description)            -> Row 3 (IPv4 Primary)
-                        3 => 5,          // Row 3 Left (IPv4 Primary)      -> Row 4 Left (Mode)
-                        4 => 7,          // Row 3 Right (IPv4 Secondary)   -> Row 4 Right (2nd VLAN)
-                        5 | 6 => 9,      // Row 4 Left/Mid                 -> Row 5 Left (Jumbo MTU)
-                        7 | 8 => 10,     // Row 4 Right                    -> Row 5 Mid (Negotiation Auto)
-                        9 => 0,          // Row 5 Left (Jumbo MTU)         -> Wrap to Row 1 Left
-                        10 => 1,         // Row 5 Mid (Negotiation Auto)   -> Wrap to Row 1 Right
+                        0 | 1 => 2,  // Row 1 (Interface / Port State) -> Row 2 (Description)
+                        2 => 3,      // Row 2 (Description)            -> Row 3 (IPv4 Primary)
+                        3 => 5,      // Row 3 Left (IPv4 Primary)      -> Row 4 Left (Mode)
+                        4 => 7,      // Row 3 Right (IPv4 Secondary)   -> Row 4 Right (2nd VLAN)
+                        5 | 6 => 9,  // Row 4 Left/Mid                 -> Row 5 Left (Jumbo MTU)
+                        7 | 8 => 10, // Row 4 Right                    -> Row 5 Mid (Negotiation Auto)
+                        9 => 0,      // Row 5 Left (Jumbo MTU)         -> Wrap to Row 1 Left
+                        10 => 1,     // Row 5 Mid (Negotiation Auto)   -> Wrap to Row 1 Right
                         _ => 0,
                     };
                 }
                 // Up Arrow moves vertically to the corresponding field in the row above
                 KeyCode::Up => {
                     app.editor_active_field = match app.editor_active_field {
-                        0 => 9,          // Row 1 Left                     -> Wrap to Row 5 Left (Jumbo MTU)
-                        1 => 10,         // Row 1 Right                    -> Wrap to Row 5 Mid (Negotiation)
-                        2 => 0,          // Row 2 (Description)            -> Row 1 (Interface Name)
-                        3 | 4 => 2,      // Row 3 (IPv4 fields)            -> Row 2 (Description)
-                        5 | 6 => 3,      // Row 4 Left/Mid                 -> Row 3 Left (IPv4 Primary)
-                        7 | 8 => 4,      // Row 4 Right                    -> Row 3 Right (IPv4 Secondary)
-                        9 => 5,          // Row 5 Left (Jumbo MTU)         -> Row 4 Left (Mode)
-                        10 => 7,         // Row 5 Mid (Negotiation Auto)   -> Row 4 Right (2nd VLAN)
+                        0 => 9,     // Row 1 Left                     -> Wrap to Row 5 Left (Jumbo MTU)
+                        1 => 10, // Row 1 Right                    -> Wrap to Row 5 Mid (Negotiation)
+                        2 => 0,  // Row 2 (Description)            -> Row 1 (Interface Name)
+                        3 | 4 => 2, // Row 3 (IPv4 fields)            -> Row 2 (Description)
+                        5 | 6 => 3, // Row 4 Left/Mid                 -> Row 3 Left (IPv4 Primary)
+                        7 | 8 => 4, // Row 4 Right                    -> Row 3 Right (IPv4 Secondary)
+                        9 => 5,     // Row 5 Left (Jumbo MTU)         -> Row 4 Left (Mode)
+                        10 => 7,    // Row 5 Mid (Negotiation Auto)   -> Row 4 Right (2nd VLAN)
                         _ => 0,
                     };
                 }
@@ -755,10 +748,8 @@ fn handle_keyboard_input(app: &mut App, key_event: event::KeyEvent) {
                             }
                         }
                     }
-                    9 => {
-                        if typed_char.is_ascii_digit() {
-                            app.editor_form.mtu.push(typed_char);
-                        }
+                    9 if typed_char.is_ascii_digit() => {
+                        app.editor_form.mtu.push(typed_char);
                     }
                     _ => {}
                 },
@@ -892,10 +883,8 @@ fn handle_keyboard_input(app: &mut App, key_event: event::KeyEvent) {
                     4 => app.l2vpn_form.target_interface.push(typed_char),
                     6 => app.l2vpn_form.neighbors_input.push(typed_char),
                     7 => app.l2vpn_form.routed_bvi.push(typed_char),
-                    8 => {
-                        if typed_char.is_ascii_digit() {
-                            app.l2vpn_form.mtu.push(typed_char);
-                        }
+                    8 if typed_char.is_ascii_digit() => {
+                        app.l2vpn_form.mtu.push(typed_char);
                     }
                     _ => {}
                 },
@@ -945,7 +934,7 @@ fn handle_keyboard_input(app: &mut App, key_event: event::KeyEvent) {
                     0 => 6,
                     1 => 7,
                     2 => 0,
-                    3 | 4 | 5 => 2,
+                    3..=5 => 2,
                     6 => 3,
                     7 => 4,
                     8 => 5,
@@ -964,14 +953,14 @@ fn handle_keyboard_input(app: &mut App, key_event: event::KeyEvent) {
                         };
                 }
                 6 => {
-                    app.service_instance_form.binding_type =
-                        match app.service_instance_form.binding_type {
-                            ServiceInstanceBinding::Xconnect => {
-                                ServiceInstanceBinding::BridgeDomain
-                            }
-                            ServiceInstanceBinding::BridgeDomain => ServiceInstanceBinding::None,
-                            ServiceInstanceBinding::None => ServiceInstanceBinding::Xconnect,
-                        };
+                    app.service_instance_form.binding_type = match app
+                        .service_instance_form
+                        .binding_type
+                    {
+                        ServiceInstanceBinding::Xconnect => ServiceInstanceBinding::BridgeDomain,
+                        ServiceInstanceBinding::BridgeDomain => ServiceInstanceBinding::None,
+                        ServiceInstanceBinding::None => ServiceInstanceBinding::Xconnect,
+                    };
                 }
                 8 if app.service_instance_form.binding_type
                     == ServiceInstanceBinding::BridgeDomain =>
@@ -1050,10 +1039,10 @@ fn handle_keyboard_input(app: &mut App, key_event: event::KeyEvent) {
                     }
                     ServiceInstanceBinding::None => {}
                 },
-                8 if app.service_instance_form.binding_type == ServiceInstanceBinding::Xconnect => {
-                    if typed_char.is_ascii_digit() {
-                        app.service_instance_form.xconnect_pw_id.push(typed_char);
-                    }
+                8 if app.service_instance_form.binding_type == ServiceInstanceBinding::Xconnect
+                    && typed_char.is_ascii_digit() =>
+                {
+                    app.service_instance_form.xconnect_pw_id.push(typed_char);
                 }
                 _ => {}
             },
@@ -1145,10 +1134,8 @@ fn handle_keyboard_input(app: &mut App, key_event: event::KeyEvent) {
                     0 => app.connection_host.push(typed_char),
                     1 => app.connection_username.push(typed_char),
                     2 => app.connection_password.push(typed_char),
-                    3 => {
-                        if typed_char.is_ascii_digit() {
-                            app.connection_port.push(typed_char);
-                        }
+                    3 if typed_char.is_ascii_digit() => {
+                        app.connection_port.push(typed_char);
                     }
                     _ => {}
                 },
@@ -1205,6 +1192,17 @@ fn handle_keyboard_input(app: &mut App, key_event: event::KeyEvent) {
             }
             KeyCode::PageUp => {
                 app.logs_scroll = app.logs_scroll.saturating_sub(10);
+            }
+            _ => {}
+        },
+
+        // -------------------------------------------------------------------
+        // Unknown SSH host key prompt (only an explicit `y` trusts the key)
+        // -------------------------------------------------------------------
+        CurrentView::HostKeyPrompt => match key_event.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => app.answer_host_key_prompt(true),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                app.answer_host_key_prompt(false)
             }
             _ => {}
         },
